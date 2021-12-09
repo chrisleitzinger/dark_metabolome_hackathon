@@ -31,11 +31,8 @@ knitr::opts_chunk$set(echo = FALSE,
                       warning = FALSE,
                       message = FALSE,
                       cache = FALSE,
-                      # fig.width = 7, fig.height = 5, 
-                      fig.align='center'#, fig.show='hold'
+                      fig.align='center'
                       )
-# options(gtsummary.print_engine = "gt")
-# options(gtsummary.as_gt.addl_cmds = "gt::tab_options(table.font.size = 14, data_row.padding = gt::px(1))")
 ```
 
 
@@ -49,7 +46,7 @@ library(themis)
 ```{r load}
 omics_data <- read_delim(paste0(here::here(), "/lusq_reprocess_2021-12-08_iron_log2_merged.txt")) %>% 
   janitor::clean_names()
-metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_columns.txt")) %>% 
+metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_v3_python_blessed.txt")) %>% 
   janitor::clean_names()
 ```
 
@@ -70,29 +67,37 @@ mldata <- omics_data %>%
 test_data <- omics_data %>% 
   # Filter identified metabolites
   filter(non_heavy_identified_flag != 1) %>% 
-  select(hmdb, starts_with("x06"))
+  select(hmdb, row_id, 
+         row_m_z, row_retention_time,
+         starts_with("x06"))
 ```
 
-# Data exploration
+# Data
+The data is imputed with minimum of the expression.  
+I focused on predicting Lipids vs Organic acids.  
 
 # Build a model
-I use the whole identified metabolites data as a traning set and will use 10 fold cross validation to evaluate the performance of the models.  
+I use the whole identified metabolites data as a training set and will use 10 fold cross validation to evaluate the performance of the models.  
 
 ```{r}
-# Explore what will need to be changed
-skimr::skim(mldata)
-
+# skimr::skim(mldata)
 train_data <- mldata %>% 
-  select(hmdb, starts_with("x06"), taxonomy_super_class) %>% 
+  select(hmdb, row_m_z, row_retention_time, 
+         starts_with("x06"), taxonomy_super_class) %>% 
   group_by(taxonomy_super_class) %>% 
   mutate(number_sample_class = n()) %>% 
   ungroup() %>% 
-  filter(number_sample_class > 5) %>% 
+  # mutate(taxonomy_super_class = case_when(
+  #   number_sample_class <= 5               ~ "Others",
+  #   TRUE                                   ~ taxonomy_super_class
+  # )) %>% 
+  # filter(number_sample_class > 5) %>% 
+  filter(str_detect(taxonomy_super_class, "Lipids|acids")) %>% 
   select(-number_sample_class) %>% 
   mutate_if(is.character, factor)
 
-skimr::skim(train_data)
-summary(train_data)
+# skimr::skim(train_data)
+# summary(train_data)
 ```
 
 ## Build a recipe
@@ -108,23 +113,26 @@ mldata_recipe <-
   step_smote(taxonomy_super_class)
 mldata_recipe
 ```
+- 1 Id = hmdb, 1 outcome = taxonomy_super_class, 89 predictors = row_m_z + row_retention_time + samples
 
-- 10 fold cross validation
+- Use a 10 fold cross validation to train and evaluate model on the training set This allow us to pick the best values for the hyperparameters of the random forest model
 ```{r}
 set.seed(123)
+
 mldata_folds <- vfold_cv(train_data, strata = taxonomy_super_class)
 ```
 
-## Build model
+<!-- ## Build model -->
 
-# RANDOM FOREST
+<!-- # RANDOM FOREST -->
 ```{r rand_forest}
-set.seed(345)
 # Model specification
+set.seed(345)
+
 ranger_spec <- rand_forest(
   mtry = tune(), 
   min_n = tune(),
-  trees = 1000) %>% 
+  trees = tune()) %>% 
   set_mode("classification") %>% 
   set_engine("ranger")
 
@@ -136,60 +144,34 @@ ranger_workflow <-
   add_model(ranger_spec)
 
 # Tuning
-doParallel::registerDoParallel()
-set.seed(678)
+# doParallel::registerDoParallel()
+
+set.seed(345)
+
 ranger_tune <-
   tune_grid(ranger_workflow, 
             resamples = mldata_folds, 
             grid = 20) # Try the 20 candidate point with each min_n and mtry
 ```
 
-# Visualize tuned parameters
 ```{r Explore Tuning Results }
-ranger_tune %>%
-  collect_metrics() %>%
-  filter(.metric == "roc_auc") %>%
-  select(mean, min_n, mtry) %>%
-  pivot_longer(min_n:mtry,
-               values_to = "value",
-               names_to = "param") %>%
-  ggplot(aes(value, mean, color = param)) +
-  geom_point(show.legend = FALSE) +
-  facet_wrap( . ~ param, scales = "free_x")
+set.seed(678)
 
-# # Tune more
-# new_grid <- grid_regular(
-#   mtry(range = c(70, 80)),
-#   min_n(range = c(0, 4)),
-#   levels = 10
-# )
-# set.seed(678)
-# sec_tune_results <- tune_grid( 
-#   ranger_workflow, 
-#   resamples = mldata_folds, 
-#   grid = new_grid
-# )
-# sec_tune_results %>% collect_metrics() %>%
-#   filter(.metric == "roc_auc") %>%
-#   mutate(min_n = factor(min_n)) %>%
-#   ggplot(aes(mtry, mean, color = min_n)) +
-#   geom_line(alpha = 0.5, size = 1.5) +
-#   geom_point()
-
-# Finalize the model with our tuned parameters
-set.seed(789)
 final_rf <- ranger_workflow %>% 
-  finalize_workflow(select_best(ranger_tune, "roc_auc"))
+  finalize_workflow(select_best(ranger_tune, "accuracy"))
+```
+
+These are the hyperpareameters value on our random forest
+```{r hyperpareameters}
 final_rf
 ```
 <br>
 
-
-
 ***
 
-```{r Performance Metrics}
+```{r fit_resamples}
 set.seed(789)
+
 rf_results <- final_rf %>% 
   fit_resamples( 
     resamples = mldata_folds,
@@ -198,25 +180,13 @@ rf_results <- final_rf %>%
   )
 ```
 
-
 # Evaluate models
-```{r evaluate models}
-# Explore Performance Metrics
+```{r Performance Metrics}
 collect_metrics(rf_results)
 ```
-Acuuracy and roc-auc show a really good performance. The sensitivity and specificity are high.
+roc-auc show a good performance. The sensitivity (ability to detect a true positive) is low and specificity are high.
 
 ```{r evaluate models}
-rf_results %>%
-  collect_predictions() %>%
-  conf_mat(taxonomy_super_class, .pred_class)
-
-rf_results %>%
-  collect_predictions() %>%
-  group_by(id) %>%
-  roc_curve(.pred_class, `.pred_Lipids and lipid-like molecules`) %>%
-  autoplot()
-
 rf_results %>% 
   collect_metrics() %>% 
   mutate(model = "rf") %>% 
@@ -235,21 +205,6 @@ rf_results %>%
 <br>
 
 ```{r evaluate models2}
-rf_results %>% 
-  conf_mat_resampled()
-
-# Visualization
-rf_results %>% 
-  collect_predictions() %>% 
-  conf_mat(truth = taxonomy_super_class , estimate = .pred_class) %>% 
-  autoplot()+
-  ggtitle("Random forest")
-
-# rf_results %>% 
-#   collect_predictions() %>% 
-#   ggplot(aes(x=taxonomy_super_class, y=.pred_class))+
-#   geom_tile()
-
 df <- rf_results %>% 
   collect_predictions()
 conf_tab <- table(df$taxonomy_super_class, df$.pred_class)
@@ -257,7 +212,7 @@ conf_tab <- conf_tab / rowSums(conf_tab)
 conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
 conf_tab$Var2 <- factor(conf_tab$Var2, rev(levels(conf_tab$Var2)))
 
-ggplot(tab, aes(Var1, Var2, fill = Freq)) +
+ggplot(conf_tab, aes(Var1, Var2, fill = Freq)) +
   geom_tile() +
   geom_text(aes(label = scales::percent(Freq))) +
   scale_fill_gradient(low = "white", high = "#3575b5")+
@@ -267,28 +222,21 @@ ggplot(tab, aes(Var1, Var2, fill = Freq)) +
 
 rf_results %>%
   collect_predictions() %>%
-  mutate(correct = case_when(
-    taxonomy_super_class == .pred_class      ~ "correct predictions",
-    TRUE                                     ~ "incorrect predictions"
-  )) %>% 
-  ggplot(aes(x=taxonomy_super_class, fill = correct))+
-  geom_bar(position = position_dodge(preserve = "single"))+
-  coord_flip()
-
-# Calculate prediction after the fact
-rf_results %>% collect_predictions() %>%
-  ppv(truth = taxonomy_super_class, estimate = .pred_class)
+  conf_mat(taxonomy_super_class, .pred_class)
 ```
+Overall prediction estimate on the cross validation set is `r rf_results %>% collect_predictions() %>% ppv(truth = taxonomy_super_class, estimate = .pred_class) %>% select(.estimate)`
+
 <br>
 
 ***
 
-# Prediction
+# Prediction on non identified metabolites
 ```{r fit on testing RF}
 ############################################################################################### AT LAST
 # Step finalize Fit : fitting to the whole training and evaluating on the testing data
 # With the model of our choice
-set.seed(789)
+set.seed(101)
+
 last_fit <- final_rf %>% 
   fit(train_data)
 
@@ -299,19 +247,20 @@ predicted_metabolites <- test_data %>%
   bind_cols(., test_fit) %>% 
   rename(taxonomy_super_class = .pred_class) %>% 
   mutate(pred = "prediction") %>% 
-  bind_rows(., train_data %>% 
-              mutate(pred = "measured")) %>% 
-  left_join(., omics_data %>% 
-              select(row_id, row_m_z, row_retention_time,
-                     hmdb),
-            by = "hmdb")
+  bind_rows(., train_data %>%  
+            #   left_join(., omics_data %>% 
+            #   select(row_id, row_m_z, row_retention_time,
+            #          hmdb),
+            # by = "hmdb"
+            # ) %>% 
+              mutate(pred = "measured"))
+
 
 predicted_metabolites %>% 
   ggplot(aes(x=row_m_z, row_retention_time, color= pred))+
   geom_point()+
-  facet_wrap(. ~ taxonomy_super_class)
-
-
+  theme_minimal()+
+  facet_wrap(. ~ taxonomy_super_class, ncol = 2)
 ```
 
 
