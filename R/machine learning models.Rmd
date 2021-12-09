@@ -54,6 +54,10 @@ metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_columns.txt")) %
 ```
 
 ```{r data prep}
+# Imputation
+omics_data <- omics_data %>% 
+  mutate(across((starts_with("x06")), .fns = ~ replace_na(., min(., na.rm = TRUE))))
+
 mldata <- omics_data %>% 
   # Filter identified metabolites
   filter(non_heavy_identified_flag == 1 & !is.na(hmdb) & !str_detect(hmdb, "\\|")) %>% 
@@ -62,6 +66,11 @@ mldata <- omics_data %>%
               select(accession, taxonomy_super_class),
             by = c("hmdb" = "accession")) %>% 
   filter(!is.na(taxonomy_super_class))
+
+test_data <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag != 1) %>% 
+  select(hmdb, starts_with("x06"))
 ```
 
 # Data exploration
@@ -75,12 +84,12 @@ skimr::skim(mldata)
 
 train_data <- mldata %>% 
   select(hmdb, starts_with("x06"), taxonomy_super_class) %>% 
-  # Imputation
-  mutate(across(where(is.numeric), .fns = ~ replace_na(., min(., na.rm = TRUE)))) %>% 
   group_by(taxonomy_super_class) %>% 
   mutate(number_sample_class = n()) %>% 
   ungroup() %>% 
-  filter(number_sample_class > 5)
+  filter(number_sample_class > 5) %>% 
+  select(-number_sample_class) %>% 
+  mutate_if(is.character, factor)
 
 skimr::skim(train_data)
 summary(train_data)
@@ -137,8 +146,6 @@ ranger_tune <-
 
 # Visualize tuned parameters
 ```{r Explore Tuning Results }
-autoplot(ranger_tune)
-
 ranger_tune %>%
   collect_metrics() %>%
   filter(.metric == "roc_auc") %>%
@@ -176,4 +183,143 @@ final_rf <- ranger_workflow %>%
 final_rf
 ```
 <br>
+
+
+
+***
+
+```{r Performance Metrics}
+set.seed(789)
+rf_results <- final_rf %>% 
+  fit_resamples( 
+    resamples = mldata_folds,
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  )
+```
+
+
+# Evaluate models
+```{r evaluate models}
+# Explore Performance Metrics
+collect_metrics(rf_results)
+```
+Acuuracy and roc-auc show a really good performance. The sensitivity and specificity are high.
+
+```{r evaluate models}
+rf_results %>%
+  collect_predictions() %>%
+  conf_mat(taxonomy_super_class, .pred_class)
+
+rf_results %>%
+  collect_predictions() %>%
+  group_by(id) %>%
+  roc_curve(.pred_class, `.pred_Lipids and lipid-like molecules`) %>%
+  autoplot()
+
+rf_results %>% 
+  collect_metrics() %>% 
+  mutate(model = "rf") %>% 
+  ggplot(aes(x= .metric, y=mean))+
+  geom_bar(stat = "identity",
+           position = position_dodge())+
+  geom_errorbar(aes(x = .metric,
+                    ymin = mean - std_err,
+                    ymax = mean + std_err),
+                width = 0.2, alpha = 0.5,
+                position=position_dodge(width=0.9))+
+  theme_minimal()+
+  scale_fill_viridis_d(option = "A")
+```
+<br>
+<br>
+
+```{r evaluate models2}
+rf_results %>% 
+  conf_mat_resampled()
+
+# Visualization
+rf_results %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = taxonomy_super_class , estimate = .pred_class) %>% 
+  autoplot()+
+  ggtitle("Random forest")
+
+# rf_results %>% 
+#   collect_predictions() %>% 
+#   ggplot(aes(x=taxonomy_super_class, y=.pred_class))+
+#   geom_tile()
+
+df <- rf_results %>% 
+  collect_predictions()
+conf_tab <- table(df$taxonomy_super_class, df$.pred_class)
+conf_tab <- conf_tab / rowSums(conf_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$Var2 <- factor(conf_tab$Var2, rev(levels(conf_tab$Var2)))
+
+ggplot(tab, aes(Var1, Var2, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq))) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Truth", y = "Prediction", title = "Confusion matrix",
+       fill = "Valid prediction")+
+  theme_minimal()
+
+rf_results %>%
+  collect_predictions() %>%
+  mutate(correct = case_when(
+    taxonomy_super_class == .pred_class      ~ "correct predictions",
+    TRUE                                     ~ "incorrect predictions"
+  )) %>% 
+  ggplot(aes(x=taxonomy_super_class, fill = correct))+
+  geom_bar(position = position_dodge(preserve = "single"))+
+  coord_flip()
+
+# Calculate prediction after the fact
+rf_results %>% collect_predictions() %>%
+  ppv(truth = taxonomy_super_class, estimate = .pred_class)
+```
+<br>
+
+***
+
+# Prediction
+```{r fit on testing RF}
+############################################################################################### AT LAST
+# Step finalize Fit : fitting to the whole training and evaluating on the testing data
+# With the model of our choice
+set.seed(789)
+last_fit <- final_rf %>% 
+  fit(train_data)
+
+test_fit <- last_fit %>% 
+  predict(test_data)
+
+predicted_metabolites <- test_data %>% 
+  bind_cols(., test_fit) %>% 
+  rename(taxonomy_super_class = .pred_class) %>% 
+  mutate(pred = "prediction") %>% 
+  bind_rows(., train_data %>% 
+              mutate(pred = "measured")) %>% 
+  left_join(., omics_data %>% 
+              select(row_id, row_m_z, row_retention_time,
+                     hmdb),
+            by = "hmdb")
+
+predicted_metabolites %>% 
+  ggplot(aes(x=row_m_z, row_retention_time, color= pred))+
+  geom_point()+
+  facet_wrap(. ~ taxonomy_super_class)
+
+
+```
+
+
+<br>
+
+
+
+
+
+
 
