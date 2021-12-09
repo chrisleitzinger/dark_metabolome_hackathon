@@ -42,22 +42,138 @@ knitr::opts_chunk$set(echo = FALSE,
 ```{r library}
 library(tidyverse)
 library(tidymodels)
+library(themis)
 ```
 
 
 ```{r load}
-metabolomics_data <- read_delim(paste0(here::here(), "/lusq_reprocess_2021-12-08_iron_log2_merged.txt"))
+omics_data <- read_delim(paste0(here::here(), "/lusq_reprocess_2021-12-08_iron_log2_merged.txt")) %>% 
+  janitor::clean_names()
+metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_columns.txt")) %>% 
+  janitor::clean_names()
 ```
 
+```{r data prep}
+mldata <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag == 1 & !is.na(hmdb) & !str_detect(hmdb, "\\|")) %>% 
+  # Join with known metabolites
+  inner_join(., metabolites_data %>% 
+              select(accession, taxonomy_super_class),
+            by = c("hmdb" = "accession")) %>% 
+  filter(!is.na(taxonomy_super_class))
+```
 
+# Data exploration
 
+# Build a model
+I use the whole identified metabolites data as a traning set and will use 10 fold cross validation to evaluate the performance of the models.  
 
+```{r}
+# Explore what will need to be changed
+skimr::skim(mldata)
 
+train_data <- mldata %>% 
+  select(hmdb, starts_with("x06"), taxonomy_super_class) %>% 
+  # Imputation
+  mutate(across(where(is.numeric), .fns = ~ replace_na(., min(., na.rm = TRUE)))) %>% 
+  group_by(taxonomy_super_class) %>% 
+  mutate(number_sample_class = n()) %>% 
+  ungroup() %>% 
+  filter(number_sample_class > 5)
 
+skimr::skim(train_data)
+summary(train_data)
+```
 
+## Build a recipe
 
+```{r recipe}
+# Recipe : data pre processing and features engineering + imputation
+mldata_recipe <-
+  # 1.model formula
+  recipe(taxonomy_super_class ~ ., data = train_data)  %>% 
+  # 2.keep these variables but not use them as either outcomes or predictors
+  update_role(hmdb, new_role = "ID") %>% 
+  # Use nearest neighbor to create new synthetic observation almost similar
+  step_smote(taxonomy_super_class)
+mldata_recipe
+```
 
+- 10 fold cross validation
+```{r}
+set.seed(123)
+mldata_folds <- vfold_cv(train_data, strata = taxonomy_super_class)
+```
 
+## Build model
 
+# RANDOM FOREST
+```{r rand_forest}
+set.seed(345)
+# Model specification
+ranger_spec <- rand_forest(
+  mtry = tune(), 
+  min_n = tune(),
+  trees = 1000) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
 
+# Set up a workflow container
+ranger_workflow <- 
+  workflow() %>% 
+  # Add preprocessor
+  add_recipe(mldata_recipe) %>%
+  add_model(ranger_spec)
+
+# Tuning
+doParallel::registerDoParallel()
+set.seed(678)
+ranger_tune <-
+  tune_grid(ranger_workflow, 
+            resamples = mldata_folds, 
+            grid = 20) # Try the 20 candidate point with each min_n and mtry
+```
+
+# Visualize tuned parameters
+```{r Explore Tuning Results }
+autoplot(ranger_tune)
+
+ranger_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "param") %>%
+  ggplot(aes(value, mean, color = param)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap( . ~ param, scales = "free_x")
+
+# # Tune more
+# new_grid <- grid_regular(
+#   mtry(range = c(70, 80)),
+#   min_n(range = c(0, 4)),
+#   levels = 10
+# )
+# set.seed(678)
+# sec_tune_results <- tune_grid( 
+#   ranger_workflow, 
+#   resamples = mldata_folds, 
+#   grid = new_grid
+# )
+# sec_tune_results %>% collect_metrics() %>%
+#   filter(.metric == "roc_auc") %>%
+#   mutate(min_n = factor(min_n)) %>%
+#   ggplot(aes(mtry, mean, color = min_n)) +
+#   geom_line(alpha = 0.5, size = 1.5) +
+#   geom_point()
+
+# Finalize the model with our tuned parameters
+set.seed(789)
+final_rf <- ranger_workflow %>% 
+  finalize_workflow(select_best(ranger_tune, "roc_auc"))
+final_rf
+```
+<br>
 
