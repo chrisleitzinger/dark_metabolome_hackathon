@@ -37,9 +37,8 @@ train_data <- mldata %>%
   select(-number_sample_class) %>% 
   mutate_if(is.character, factor)
 
-
-model_metabolite <- function(train_data, test_data) {
-
+########## RAMDOM FOREST
+forest_metabolite <- function(train_data, test_data) {
 
   mldata_recipe <-
     # 1.model formula
@@ -101,4 +100,70 @@ model_metabolite <- function(train_data, test_data) {
 
 }
 
-model_metabolite(train_data = train_data, test_data = test_data)
+forest_metabolite(train_data = train_data, test_data = test_data)
+
+
+
+########## LOGISTIC REGRESSION
+logreg_metabolite <- function(train_data, test_data) {
+  
+  
+  mldata_recipe <-
+    # 1.model formula
+    recipe(taxonomy_super_class ~ ., data = train_data)  %>% 
+    # 2.keep these variables but not use them as either outcomes or predictors
+    update_role(hmdb, new_role = "ID") %>% 
+    # Use nearest neighbor to create new synthetic observation almost similar
+    step_smote(taxonomy_super_class)
+  set.seed(123)
+  mldata_folds <- vfold_cv(train_data, strata = taxonomy_super_class)
+  
+  set.seed(345)
+  
+  glmnet_spec <- 
+    logistic_reg(penalty = tune(), mixture = tune()) %>%
+    set_mode("classification") %>% 
+    set_engine("glmnet")
+  
+  # Set up a workflow container
+  glmnet_workflow <- 
+    workflow() %>% 
+    add_recipe(mldata_recipe) %>% 
+    add_model(glmnet_spec)
+  
+  # Tuning
+  registerDoParallel()
+  set.seed(345)
+  glmnet_grid <- 
+    tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20),
+                                 mixture = c(0, 0.05, 0.2, 0.4, 0.6, 0.8, 1))
+  glmnet_tune <- 
+    tune_grid(glmnet_workflow, resamples = mldata_folds, grid = glmnet_grid)
+  set.seed(678)
+  final_glmnet <- glmnet_workflow %>% 
+    finalize_workflow(select_best(glmnet_tune, "roc_auc"))
+  
+  set.seed(101)
+  
+  last_fit <- final_glmnet %>% 
+    fit(train_data)
+  
+  test_fit <- last_fit %>% 
+    predict(test_data)
+  
+  predicted_metabolites <- test_data %>% 
+    bind_cols(., test_fit) %>% 
+    rename(taxonomy_super_class = .pred_class) %>% 
+    mutate(pred = "prediction") %>% 
+    bind_rows(., train_data %>% 
+                mutate(pred = "measured"))
+  
+  predicted_metabolites %>% 
+    ggplot(aes(x=row_m_z, row_retention_time, color= pred))+
+    geom_point()+
+    theme_minimal()+
+    facet_wrap(. ~ taxonomy_super_class, ncol = 2)
+  
+}
+
+logreg_metabolite(train_data = train_data, test_data = test_data)

@@ -176,7 +176,7 @@ xgboost_tune <-
 
 ```{r}
 glmnet_spec <- 
-  logistic_reg(penalty = tune(), mixture = tune()) %>% # Looks ridge would increase really slightly mixture = 0
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
   set_mode("classification") %>% 
   set_engine("glmnet") 
 glmnet_workflow <- 
