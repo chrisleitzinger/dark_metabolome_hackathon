@@ -44,14 +44,20 @@ library(themis)
 
 
 ```{r load}
+# Samples, retention time and m/z data
 omics_data <- read_delim(paste0(here::here(), "/lusq_reprocess_2021-12-08_iron_log2_merged.txt")) %>% 
   janitor::clean_names()
+#
 metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_v3_python_blessed.txt")) %>% 
   janitor::clean_names()
 ```
 
+# Data
+The data is imputed with minimum of the expression.  
+
+We are using the known metabolites in samples to built the machine learning dataset.
 ```{r data prep}
-# Imputation
+# Imputation samples data
 omics_data <- omics_data %>% 
   mutate(across((starts_with("x06")), .fns = ~ replace_na(., min(., na.rm = TRUE))))
 
@@ -64,7 +70,7 @@ mldata <- omics_data %>%
             by = c("hmdb" = "accession")) %>% 
   filter(!is.na(taxonomy_super_class))
 
-test_data <- omics_data %>% 
+unknown_metabolites <- omics_data %>% 
   # Filter identified metabolites
   filter(non_heavy_identified_flag != 1) %>% 
   select(hmdb, row_id, 
@@ -72,16 +78,10 @@ test_data <- omics_data %>%
          starts_with("x06"))
 ```
 
-# Data
-The data is imputed with minimum of the expression.  
-I focused on predicting Lipids Yes vs No by building the model on Lipids and Organic acids data in the training set.  
-
-# Build a model
-I use the whole identified metabolites data as a training set and will use 10 fold cross validation to evaluate the performance of the models.  
-
+I created a variable `is_lipids` to use as the outcome. We will use Samples, retention time and m/z information as predictors.
 ```{r}
 # skimr::skim(mldata)
-train_data <- mldata %>% 
+mldata <- mldata %>% 
   select(hmdb, row_m_z, row_retention_time, 
          starts_with("x06"), taxonomy_super_class) %>% 
   group_by(taxonomy_super_class) %>% 
@@ -92,7 +92,7 @@ train_data <- mldata %>%
   #   TRUE                                   ~ taxonomy_super_class
   # )) %>% 
   # filter(number_sample_class > 5) %>% 
-  filter(str_detect(taxonomy_super_class, "Lipids|acids")) %>%
+  # filter(str_detect(taxonomy_super_class, "Lipids|acids")) %>%
   mutate(is_lipids = case_when(
     str_detect(taxonomy_super_class, "Lipids")              ~ "Yes",
     TRUE                                                    ~ "No"
@@ -103,6 +103,23 @@ train_data <- mldata %>%
 # skimr::skim(train_data)
 # summary(train_data)
 ```
+
+The data is split in to a training dataset (75%) and testing dataset (25%).
+
+```{r}
+set.seed(123)
+
+# 1. Splitting the data
+# 3/4 of the data into the training set but split evenly winthin race
+data_split <- initial_split(mldata, prop = 3/4, strata = is_lipids)
+# Create training and testing datasets:
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+```
+
+# Build a model
+I use 10 fold cross validation datasets from the training to evaluate the performance of the models.  
+
 
 ## Build a recipe
 
@@ -118,7 +135,7 @@ mldata_recipe <-
 mldata_recipe
 ```
 - 1 Id = hmdb, 1 outcome = is_lipids, 89 predictors = row_m_z + row_retention_time + samples  
-- the models use `step_smote` to balance the cases in the training set. It use nearest neighbor to create new synthetic observation almost similar.  
+- the models use `step_smote` to balance the outcome cases in the training set. This use nearest neighbor to create new synthetic observation almost similar.  
 - Use a 10 fold cross validation to train and evaluate model on the training set This allow us to pick the best values for the hyperparameters of the random forest model  
 ```{r}
 set.seed(123)
@@ -366,20 +383,95 @@ Overall prediction estimate for logistic regression on the cross validation set 
 
 ***
 
-# Prediction on non identified metabolites : Lipids Yes / No (Ramdom forest)
-```{r fit on testing RF}
+# Prediction on test data identified metabolites : Lipids Yes / No (Ramdom forest)
+```{r}
 ############################################################################################### AT LAST
 # Step finalize Fit : fitting to the whole training and evaluating on the testing data
 # With the model of our choice
 set.seed(101)
 
 last_fit <- final_rf %>% 
+  last_fit(data_split)
+
+
+###################
+
+final_fit <- last_fit
+
+
+collect_metrics(final_fit)
+# Compare to the training previous number
+collect_metrics(rf_results) # as a meminder of previous results
+# Test data is a littke lower with samll SD
+
+collect_metrics(final_fit) %>% 
+  mutate(set = "testing") %>% 
+  rename(mean = .estimate) %>% 
+  bind_rows(collect_metrics(rf_results) %>% 
+              mutate(set = "training")) %>% 
+  filter(str_detect(.metric, "accuracy|roc_auc")) %>% 
+  ggplot(aes(x= .metric, y=mean, fill = set))+
+  geom_bar(stat = "identity",
+           position = position_dodge()) + 
+  geom_errorbar(aes(xmin = mean - std_err,
+                    xmax = mean + std_err),
+                width = 0.2, alpha = 0.5)
+collect_metrics(final_fit) %>% 
+  mutate(set = "testing") %>% 
+  rename(mean = .estimate) %>% 
+  bind_rows(collect_metrics(rf_results) %>% 
+              mutate(set = "training")) %>% 
+  filter(str_detect(.metric, "accuracy|roc_auc")) %>% 
+  ggplot(aes(x= .metric, y=mean, color = set))+
+  geom_point() + 
+  geom_errorbar(aes(xmin = mean - std_err,
+                    xmax = mean + std_err),
+                width = 0.2, alpha = 0.5)
+
+
+final_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = is_lipids, estimate = .pred_class)
+final_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = is_lipids, estimate = .pred_class) %>% 
+  autoplot()
+##############################
+
+# test_fit <- last_fit %>% 
+#   predict(test_data)
+
+predicted <- final_fit %>% 
+  collect_predictions()
+
+test_data %>% 
+  rename(Original_is_lipids = is_lipids) %>% 
+  bind_cols(., predicted) %>% 
+  rename(predicted_is_lipids = .pred_class) %>% 
+  mutate(concordant = case_when(
+    Original_is_lipids == predicted_is_lipids      ~ "truly classified",
+    Original_is_lipids != predicted_is_lipids      ~ "wrongly classified",
+  )) %>% 
+  ggplot(aes(x=row_m_z, row_retention_time, color= concordant))+
+  geom_point()+
+  theme_minimal()+
+  facet_wrap(. ~ Original_is_lipids, ncol = 2)
+```
+<br>
+
+***
+
+# Prediction on non identified metabolites : Lipids Yes / No (Ramdom forest)
+```{r fit on testing RF}
+set.seed(101)
+
+last_fit <- final_rf %>% 
   fit(train_data)
 
 test_fit <- last_fit %>% 
-  predict(test_data)
+  predict(unknown_metabolites)
 
-predicted_metabolites <- test_data %>% 
+predicted_metabolites <- unknown_metabolites %>% 
   bind_cols(., test_fit) %>% 
   rename(is_lipids = .pred_class) %>% 
   mutate(pred = "prediction") %>% 
@@ -395,6 +487,7 @@ predicted_metabolites %>%
 ```
 
 # Prediction on non identified metabolites : Lipids Yes / No (Logistic Regression)
+The blue points are the unknown metabolites that we can predict to be lipids or not. We can see a pretty good ovelap with the orange point from the known metabolites dataset.
 ```{r}
 ############################################################################################### AT LAST
 # Step finalize Fit : fitting to the whole training and evaluating on the testing data
@@ -405,13 +498,13 @@ last_fit <- final_glmnet %>%
   fit(train_data)
 
 test_fit <- last_fit %>% 
-  predict(test_data)
+  predict(unknown_metabolites)
 
-predicted_metabolites <- test_data %>% 
+predicted_metabolites <- unknown_metabolites %>% 
   bind_cols(., test_fit) %>% 
   rename(is_lipids = .pred_class) %>% 
   mutate(pred = "prediction") %>% 
-  bind_rows(., train_data %>%  
+  bind_rows(., mldata %>%  
               mutate(pred = "measured"))
 
 
@@ -421,11 +514,12 @@ predicted_metabolites %>%
   theme_minimal()+
   facet_wrap(. ~ is_lipids, ncol = 2)
 ```
-
 <br>
 
 
+# do m/z and retention time only
 
+# do a classification others....?
 
 
 
