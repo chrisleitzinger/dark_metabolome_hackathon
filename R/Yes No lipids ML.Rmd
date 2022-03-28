@@ -52,7 +52,9 @@ metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_v3_python_blesse
   janitor::clean_names()
 ```
 
-# Data
+# I.Prediction using 
+
+## Data
 The data is imputed with minimum of the expression.  
 
 We are using the known metabolites in samples to built the machine learning dataset.
@@ -117,11 +119,11 @@ train_data <- training(data_split)
 test_data  <- testing(data_split)
 ```
 
-# Build a model
+## Build a model
 I use 10 fold cross validation datasets from the training to evaluate the performance of the models.  
 
 
-## Build a recipe
+### Build a recipe
 
 ```{r recipe}
 # Recipe : data pre processing and features engineering + imputation
@@ -276,7 +278,7 @@ kknn_results <- final_kknn %>%
   )
 ```
 
-# Evaluate models
+## Evaluate models
 ```{r Performance Metrics}
 rf_results %>% # Compare both models
   collect_metrics() %>% 
@@ -383,7 +385,7 @@ Overall prediction estimate for logistic regression on the cross validation set 
 
 ***
 
-# Prediction on test data identified metabolites : Lipids Yes / No (Ramdom forest)
+## Prediction on test data identified metabolites : Lipids Yes / No (Ramdom forest)
 ```{r}
 ############################################################################################### AT LAST
 # Step finalize Fit : fitting to the whole training and evaluating on the testing data
@@ -461,7 +463,7 @@ test_data %>%
 
 ***
 
-# Prediction on non identified metabolites : Lipids Yes / No (Ramdom forest)
+## Prediction on non identified metabolites : Lipids Yes / No (Ramdom forest)
 ```{r fit on testing RF}
 set.seed(101)
 
@@ -486,7 +488,7 @@ predicted_metabolites %>%
   facet_wrap(. ~ is_lipids, ncol = 2)
 ```
 
-# Prediction on non identified metabolites : Lipids Yes / No (Logistic Regression)
+## Prediction on non identified metabolites : Lipids Yes / No (Logistic Regression)
 The blue points are the unknown metabolites that we can predict to be lipids or not. We can see a pretty good ovelap with the orange point from the known metabolites dataset.
 ```{r}
 ############################################################################################### AT LAST
@@ -517,7 +519,466 @@ predicted_metabolites %>%
 <br>
 
 
-# do m/z and retention time only
+# II.Precdition using m/z and retention time only
+Again,  
+
+## Data
+The data is imputed with minimum of the expression.  
+
+We are using the known metabolites in samples to built the machine learning dataset.
+```{r data prep 2}
+mldata <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag == 1 & !is.na(hmdb) & !str_detect(hmdb, "\\|")) %>% 
+  # Join with known metabolites
+  inner_join(., metabolites_data %>% 
+              select(accession, taxonomy_super_class),
+            by = c("hmdb" = "accession")) %>% 
+  filter(!is.na(taxonomy_super_class))
+
+unknown_metabolites <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag != 1) %>% 
+  select(hmdb, row_id, 
+         row_m_z, row_retention_time)
+```
+
+I created a variable `is_lipids` to use as the outcome. We will use retention time and m/z information as predictors.
+```{r}
+# skimr::skim(mldata)
+mldata <- mldata %>% 
+  select(hmdb, row_m_z, row_retention_time, 
+         taxonomy_super_class) %>% 
+  group_by(taxonomy_super_class) %>% 
+  mutate(number_sample_class = n()) %>% 
+  ungroup() %>% 
+  # mutate(taxonomy_super_class = case_when(
+  #   number_sample_class <= 5               ~ "Others",
+  #   TRUE                                   ~ taxonomy_super_class
+  # )) %>% 
+  # filter(number_sample_class > 5) %>% 
+  # filter(str_detect(taxonomy_super_class, "Lipids|acids")) %>%
+  mutate(is_lipids = case_when(
+    str_detect(taxonomy_super_class, "Lipids")              ~ "Yes",
+    TRUE                                                    ~ "No"
+  )) %>% 
+  select(-number_sample_class, -taxonomy_super_class) %>% 
+  mutate_if(is.character, factor)
+
+# skimr::skim(train_data)
+# summary(train_data)
+```
+
+The data is split in to a training dataset (75%) and testing dataset (25%).
+
+```{r}
+set.seed(123)
+
+# 1. Splitting the data
+# 3/4 of the data into the training set but split evenly winthin race
+data_split <- initial_split(mldata, prop = 3/4, strata = is_lipids)
+# Create training and testing datasets:
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+```
+
+## Build a model
+I use 10 fold cross validation datasets from the training to evaluate the performance of the models.  
+
+
+### Build a recipe
+
+```{r recipe 2}
+# Recipe : data pre processing and features engineering + imputation
+mldata_recipe <-
+  # 1.model formula
+  recipe(is_lipids ~ ., data = train_data)  %>% 
+  # 2.keep these variables but not use them as either outcomes or predictors
+  update_role(hmdb, new_role = "ID") %>% 
+  # Use nearest neighbor to create new synthetic observation almost similar
+  step_smote(is_lipids)
+mldata_recipe
+```
+- 1 Id = hmdb, 1 outcome = is_lipids, 89 predictors = row_m_z + row_retention_time + samples  
+- the models use `step_smote` to balance the outcome cases in the training set. This use nearest neighbor to create new synthetic observation almost similar.  
+- Use a 10 fold cross validation to train and evaluate model on the training set This allow us to pick the best values for the hyperparameters of the random forest model  
+```{r}
+set.seed(123)
+
+mldata_folds <- vfold_cv(train_data, strata = is_lipids)
+```
+
+<!-- ## Build model -->
+
+<!-- # RANDOM FOREST -->
+```{r rand_forest 2}
+# Model specification
+set.seed(345)
+
+ranger_spec <- rand_forest(
+  mtry = tune(), 
+  min_n = tune(),
+  trees = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+# Set up a workflow container
+ranger_workflow <- 
+  workflow() %>% 
+  # Add preprocessor
+  add_recipe(mldata_recipe) %>%
+  add_model(ranger_spec)
+
+# Tuning
+# doParallel::registerDoParallel()
+
+set.seed(345)
+
+ranger_tune <-
+  tune_grid(ranger_workflow, 
+            resamples = mldata_folds, 
+            grid = 20) # Try the 20 candidate point with each min_n and mtry
+```
+
+
+```{r xgboost 2}
+xgboost_spec <- 
+  boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), 
+             loss_reduction = tune(), sample_size = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost") 
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(xgboost_spec) 
+set.seed(345)
+xgboost_tune <-
+  tune_grid(xgboost_workflow, resamples = mldata_folds, grid = 10)
+```
+
+```{r}
+glmnet_spec <- 
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(glmnet_spec) 
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), mixture = c(0, 0.05, 
+                                                                                      0.2, 0.4, 0.6, 0.8, 1)) 
+set.seed(345)
+glmnet_tune <- 
+  tune_grid(glmnet_workflow, resamples = mldata_folds, grid = glmnet_grid) 
+```
+
+```{r}
+kknn_spec <- 
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn") 
+kknn_workflow <- 
+  workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(kknn_spec) 
+set.seed(345)
+kknn_tune <-
+  tune_grid(kknn_workflow, 
+            resamples = mldata_folds, 20)
+```
+
+
+```{r Explore Tuning Results 2}
+set.seed(678)
+
+final_rf <- ranger_workflow %>% 
+  finalize_workflow(select_best(ranger_tune, "accuracy"))
+final_xgboost <- xgboost_workflow %>% 
+  finalize_workflow(select_best(xgboost_tune, "roc_auc"))
+final_glmnet <- glmnet_workflow %>% 
+  finalize_workflow(select_best(glmnet_tune, "roc_auc"))
+final_kknn <- kknn_workflow %>% 
+  finalize_workflow(select_best(kknn_tune, "roc_auc"))
+```
+
+These are the hyperpareameters value on our random forest and logistic regression
+```{r hyperpareameters 2}
+final_rf
+final_glmnet
+```
+<br>
+
+***
+
+```{r fit_resamples 2}
+set.seed(789)
+rf_results <- final_rf %>% 
+  fit_resamples( 
+    resamples = mldata_folds,
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  )
+set.seed(789)
+xgboost_results <- final_xgboost %>% 
+  fit_resamples(
+    resamples = mldata_folds,
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    control = control_resamples(save_pred = TRUE)
+  )
+set.seed(789)
+glmnet_results <- final_glmnet %>% 
+  fit_resamples(
+    resamples = mldata_folds,
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    control = control_resamples(save_pred = TRUE)
+  )
+set.seed(789)
+kknn_results <- final_kknn %>% 
+  fit_resamples(
+    resamples = mldata_folds,
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    control = control_resamples(save_pred = TRUE)
+  )
+```
+
+## Evaluate models
+```{r Performance Metrics 2}
+rf_results %>% # Compare both models
+  collect_metrics() %>% 
+  select(".metric", rf_mean = mean) %>% 
+  full_join(., glmnet_results %>% 
+              collect_metrics() %>% 
+              select(".metric", glmet_mean = mean), by = ".metric") %>% 
+  full_join(., xgboost_results %>% 
+              collect_metrics() %>% 
+              select(".metric", xgboost_mean = mean), by = ".metric") %>% 
+  full_join(., kknn_results %>% 
+              collect_metrics() %>% 
+              select(".metric", kknn_mean = mean), by = ".metric")
+
+rf_results %>% # Compare both models
+  collect_metrics() %>% 
+  mutate(model = "rf") %>% 
+  bind_rows(glmnet_results %>% 
+              collect_metrics() %>% 
+              mutate(model = "glmnet")) %>% 
+  bind_rows(xgboost_results %>% 
+              collect_metrics() %>% 
+              mutate(model = "xgboost")) %>% 
+  bind_rows(kknn_results %>% 
+              collect_metrics() %>% 
+              mutate(model = "kknn")) %>% 
+  
+  ggplot(aes(x= .metric, y=mean, fill = model))+
+  geom_bar(stat = "identity",
+           position = position_dodge())+
+  geom_errorbar(aes(x = .metric,
+                    ymin = mean - std_err,
+                    ymax = mean + std_err),
+                width = 0.2, alpha = 0.5,
+                position=position_dodge(width=0.9))+
+  theme_minimal()+
+  scale_fill_viridis_d(option = "A")
+```
+roc-auc and accuracy show a really good performance. The sensitivity (ability to detect a true positive) and specificity are good.
+
+```{r evaluate models 2}
+rf_results %>% # Compare both models
+  collect_predictions() %>% 
+  mutate(model = "rf") %>% 
+  bind_rows(glmnet_results %>% 
+              collect_predictions() %>% 
+              mutate(model = "glmnet")) %>% 
+  bind_rows(xgboost_results %>% 
+              collect_predictions() %>% 
+              mutate(model = "xgboost")) %>% 
+  bind_rows(kknn_results %>% 
+              collect_predictions() %>% 
+              mutate(model = "kknn")) %>% 
+  group_by(model) %>% 
+  roc_curve(is_lipids, .pred_No) %>% 
+  autoplot()
+```
+<br>
+<br>
+
+```{r evaluate models2-2}
+df <- rf_results %>% 
+  collect_predictions()
+conf_tab <- table(df$is_lipids, df$.pred_class)
+conf_tab <- conf_tab / rowSums(conf_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$Var2 <- factor(conf_tab$Var2, rev(levels(conf_tab$Var2)))
+
+ggplot(conf_tab, aes(Var1, Var2, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq))) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Truth", y = "Prediction", title = "Confusion matrix for Ramdom Forest",
+       fill = "Valid prediction")+
+  theme_minimal()
+
+rf_results %>%
+  collect_predictions() %>%
+  conf_mat(is_lipids, .pred_class)
+
+df <- glmnet_results %>% 
+  collect_predictions()
+conf_tab <- table(df$is_lipids, df$.pred_class)
+conf_tab <- conf_tab / rowSums(conf_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$Var2 <- factor(conf_tab$Var2, rev(levels(conf_tab$Var2)))
+
+ggplot(conf_tab, aes(Var1, Var2, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq))) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Truth", y = "Prediction", title = "Confusion matrix for Logistic Regression",
+       fill = "Valid prediction")+
+  theme_minimal()
+
+glmnet_results %>%
+  collect_predictions() %>%
+  conf_mat(is_lipids, .pred_class)
+```
+Overall prediction estimate for ramdom forest on the cross validation set is `r rf_results %>% collect_predictions() %>% ppv(truth = is_lipids, estimate = .pred_class) %>% select(.estimate)`  
+Overall prediction estimate for logistic regression on the cross validation set is `r glmnet_results %>% collect_predictions() %>% ppv(truth = is_lipids, estimate = .pred_class) %>% select(.estimate)`
+
+<br>
+
+***
+
+## Prediction on test data identified metabolites : Lipids Yes / No (Ramdom forest)
+```{r}
+############################################################################################### AT LAST
+# Step finalize Fit : fitting to the whole training and evaluating on the testing data
+# With the model of our choice
+set.seed(101)
+
+last_fit <- final_rf %>% 
+  last_fit(data_split)
+
+
+###################
+
+final_fit <- last_fit
+
+
+collect_metrics(final_fit)
+# Compare to the training previous number
+collect_metrics(rf_results) # as a meminder of previous results
+# Test data is a littke lower with samll SD
+
+collect_metrics(final_fit) %>% 
+  mutate(set = "testing") %>% 
+  rename(mean = .estimate) %>% 
+  bind_rows(collect_metrics(rf_results) %>% 
+              mutate(set = "training")) %>% 
+  filter(str_detect(.metric, "accuracy|roc_auc")) %>% 
+  ggplot(aes(x= .metric, y=mean, fill = set))+
+  geom_bar(stat = "identity",
+           position = position_dodge()) + 
+  geom_errorbar(aes(xmin = mean - std_err,
+                    xmax = mean + std_err),
+                width = 0.2, alpha = 0.5)
+collect_metrics(final_fit) %>% 
+  mutate(set = "testing") %>% 
+  rename(mean = .estimate) %>% 
+  bind_rows(collect_metrics(rf_results) %>% 
+              mutate(set = "training")) %>% 
+  filter(str_detect(.metric, "accuracy|roc_auc")) %>% 
+  ggplot(aes(x= .metric, y=mean, color = set))+
+  geom_point() + 
+  geom_errorbar(aes(xmin = mean - std_err,
+                    xmax = mean + std_err),
+                width = 0.2, alpha = 0.5)
+
+
+final_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = is_lipids, estimate = .pred_class)
+final_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = is_lipids, estimate = .pred_class) %>% 
+  autoplot()
+##############################
+
+# test_fit <- last_fit %>% 
+#   predict(test_data)
+
+predicted <- final_fit %>% 
+  collect_predictions()
+
+test_data %>% 
+  rename(Original_is_lipids = is_lipids) %>% 
+  bind_cols(., predicted) %>% 
+  rename(predicted_is_lipids = .pred_class) %>% 
+  mutate(concordant = case_when(
+    Original_is_lipids == predicted_is_lipids      ~ "truly classified",
+    Original_is_lipids != predicted_is_lipids      ~ "wrongly classified",
+  )) %>% 
+  ggplot(aes(x=row_m_z, row_retention_time, color= concordant))+
+  geom_point()+
+  theme_minimal()+
+  facet_wrap(. ~ Original_is_lipids, ncol = 2)
+```
+<br>
+
+***
+
+## Prediction on non identified metabolites : Lipids Yes / No (Ramdom forest)
+```{r fit on testing RF 2}
+set.seed(101)
+
+last_fit <- final_rf %>% 
+  fit(train_data)
+
+test_fit <- last_fit %>% 
+  predict(unknown_metabolites)
+
+predicted_metabolites <- unknown_metabolites %>% 
+  bind_cols(., test_fit) %>% 
+  rename(is_lipids = .pred_class) %>% 
+  mutate(pred = "prediction") %>% 
+  bind_rows(., train_data %>%  
+              mutate(pred = "measured"))
+
+
+predicted_metabolites %>% 
+  ggplot(aes(x=row_m_z, row_retention_time, color= pred))+
+  geom_point()+
+  theme_minimal()+
+  facet_wrap(. ~ is_lipids, ncol = 2)
+```
+
+## Prediction on non identified metabolites : Lipids Yes / No (Logistic Regression)
+The blue points are the unknown metabolites that we can predict to be lipids or not. We can see a pretty good ovelap with the orange point from the known metabolites dataset.
+```{r}
+############################################################################################### AT LAST
+# Step finalize Fit : fitting to the whole training and evaluating on the testing data
+# With the model of our choice
+set.seed(101)
+
+last_fit <- final_glmnet %>% 
+  fit(train_data)
+
+test_fit <- last_fit %>% 
+  predict(unknown_metabolites)
+
+predicted_metabolites <- unknown_metabolites %>% 
+  bind_cols(., test_fit) %>% 
+  rename(is_lipids = .pred_class) %>% 
+  mutate(pred = "prediction") %>% 
+  bind_rows(., mldata %>%  
+              mutate(pred = "measured"))
+
+
+predicted_metabolites %>% 
+  ggplot(aes(x=row_m_z, row_retention_time, color= pred))+
+  geom_point()+
+  theme_minimal()+
+  facet_wrap(. ~ is_lipids, ncol = 2)
+```
 
 # do a classification others....?
 
