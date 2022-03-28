@@ -385,6 +385,52 @@ Overall prediction estimate for logistic regression on the cross validation set 
 
 ***
 
+## Features importance
+```{r vip}
+############################################################################################### Step Explore of features importance ----
+library(vip) 
+###################################### glmnet----
+# Need to train the model one more time but without tuning to go faster
+importance_spec <- glmnet_spec %>% 
+  finalize_model(select_best(glmnet_tune, "roc_auc")) %>% 
+  set_engine("glmnet", importance = "permutation") # permutation based importance
+
+# represents the mean decrease in node impurity (and not the mean decrease in accuracy)
+workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(importance_spec) %>% 
+  fit(train_data) %>% 
+  extract_fit_parsnip() %>% 
+  vip(aesthetics = list(alpha = 0.5, fill = "midnightblue"),
+      # geom = "point",
+      num_features = 20
+  )+
+ggtitle("logistic regression")
+
+
+###################################### Ranger----
+
+# Need to train the model one more time but without tuning to go faster
+importance_spec <- ranger_spec %>% 
+  finalize_model(select_best(ranger_tune, "roc_auc")) %>% 
+  set_engine("ranger", importance = "permutation") # permutation based importance
+
+# represents the mean decrease in node impurity (and not the mean decrease in accuracy)
+workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(importance_spec) %>% 
+  fit(train_data) %>% 
+  extract_fit_parsnip() %>% 
+  vip(aesthetics = list(alpha = 0.5, fill = "midnightblue"),
+      # geom = "point",
+      num_features = 20
+  )+
+ggtitle("Random forest")
+```
+<br>
+
+***
+
 ## Prediction on test data identified metabolites : Lipids Yes / No (Ramdom forest)
 ```{r}
 ############################################################################################### AT LAST
@@ -847,6 +893,54 @@ Overall prediction estimate for logistic regression on the cross validation set 
 <br>
 
 ***
+
+## Features importance
+```{r vip 2}
+############################################################################################### Step Explore of features importance ----
+library(vip) 
+###################################### glmnet----
+# Need to train the model one more time but without tuning to go faster
+importance_spec <- glmnet_spec %>% 
+  finalize_model(select_best(glmnet_tune, "roc_auc")) %>% 
+  set_engine("glmnet", importance = "permutation") # permutation based importance
+
+# represents the mean decrease in node impurity (and not the mean decrease in accuracy)
+workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(importance_spec) %>% 
+  fit(train_data) %>% 
+  extract_fit_parsnip() %>% 
+  vip(aesthetics = list(alpha = 0.5, fill = "midnightblue"),
+      # geom = "point",
+      num_features = 20
+  )+
+ggtitle("logistic regression")
+
+
+###################################### Ranger----
+
+# Need to train the model one more time but without tuning to go faster
+importance_spec <- ranger_spec %>% 
+  finalize_model(select_best(ranger_tune, "roc_auc")) %>% 
+  set_engine("ranger", importance = "permutation") # permutation based importance
+
+# represents the mean decrease in node impurity (and not the mean decrease in accuracy)
+workflow() %>% 
+  add_recipe(mldata_recipe) %>% 
+  add_model(importance_spec) %>% 
+  fit(train_data) %>% 
+  extract_fit_parsnip() %>% 
+  vip(aesthetics = list(alpha = 0.5, fill = "midnightblue"),
+      # geom = "point",
+      num_features = 20
+  )+
+ggtitle("Random forest")
+```
+<br>
+
+***
+
+<br>
 
 ## Prediction on test data identified metabolites : Lipids Yes / No (Ramdom forest)
 ```{r}
