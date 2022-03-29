@@ -59,9 +59,11 @@ The data is imputed with minimum of the expression.
 
 We are using the known metabolites in samples to built the machine learning dataset.
 ```{r data prep}
-# Imputation samples data
 omics_data <- omics_data %>% 
-  mutate(across((starts_with("x06")), .fns = ~ replace_na(., min(., na.rm = TRUE))))
+  # Imputation samples data
+  mutate(across((starts_with("x06")), .fns = ~ replace_na(., min(., na.rm = TRUE)))) %>% 
+  # cleaning retention time to eliminate false detection during set up, washing and equilibrating the HPLC
+  filter(row_retention_time > 0.5 & row_retention_time < 14)
 
 mldata <- omics_data %>% 
   # Filter identified metabolites
@@ -1071,6 +1073,8 @@ predicted_metabolites %>%
   ggplot(aes(x=row_m_z, row_retention_time, color= pred))+
   geom_point()+
   theme_minimal()+
+  scale_color_manual(values = c("#0B0405FF", "#54C9ADFF"))+
+  # scale_color_viridis_d(option = "G")+
   facet_wrap(. ~ is_lipids, ncol = 2)
 ```
 
