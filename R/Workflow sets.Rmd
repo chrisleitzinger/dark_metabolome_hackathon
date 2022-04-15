@@ -1,0 +1,366 @@
+---
+title: "Machine learning models with workflowsets"
+author: "Christelle Colin-Leitzinger"
+date: '`r Sys.Date()`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: united
+    highlight: pygments
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+.figure {
+   margin-top: 25px;
+   margin-bottom: 10px;
+}
+
+table {
+    margin-top: 10px;
+    margin-bottom: 25px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = FALSE,
+                      fig.align='center'
+                      )
+```
+
+
+```{r library}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(discrim)
+library(klaR)
+```
+
+
+```{r load}
+# Samples, retention time and m/z data
+omics_data <- read_delim(paste0(here::here(), "/lusq_reprocess_2021-12-08_iron_log2_merged.txt")) %>% 
+  janitor::clean_names()
+#
+metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_v3_python_blessed.txt")) %>% 
+  janitor::clean_names()
+```
+
+# I.Prediction using Samples, retention time and m/z information as predictors.
+
+We are trying to predict metabolite classifications. In our proteomic analysis, about 88% of the metabolites are not identified. We want to see if we can predict with a good accuracy the classification of these metabolites based on retention time and m/z information. We also want to access if using patients samples as predictors in addition to theses 2 parameters can increase the prediction.  
+
+## Data preprocessing
+
+- We are focusing on predicting if a metabolite is a lipid or not. I am using a variable I created, `is_lipids`, as the outcome.
+
+- Patient samples present missing values :
+The data is imputed with minimum of the expression.  
+
+```{r data prep}
+omics_data <- omics_data %>% 
+  # Imputation samples data
+  mutate(across((starts_with("x06")), .fns = ~ replace_na(., min(., na.rm = TRUE)))) %>% 
+  # cleaning retention time to eliminate false detection during set up, washing and equilibrating the HPLC
+  filter(row_retention_time > 0.5 & row_retention_time < 14)
+
+mldata <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag == 1 & !is.na(hmdb) & !str_detect(hmdb, "\\|")) %>% 
+  # Join with known metabolites
+  inner_join(., metabolites_data %>% 
+              dplyr::select(accession, taxonomy_super_class),
+            by = c("hmdb" = "accession")) %>% 
+  filter(!is.na(taxonomy_super_class))
+
+unknown_metabolites <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag != 1) %>% 
+  dplyr::select(hmdb, row_id, 
+         row_m_z, row_retention_time,
+         starts_with("x06"))
+```
+
+```{r}
+# skimr::skim(mldata)
+mldata <- mldata %>% 
+  dplyr::select(hmdb, row_m_z, row_retention_time, 
+         starts_with("x06"), taxonomy_super_class) %>% 
+  group_by(taxonomy_super_class) %>% 
+  mutate(number_sample_class = n()) %>% 
+  ungroup() %>% 
+  # mutate(taxonomy_super_class = case_when(
+  #   number_sample_class <= 5               ~ "Others",
+  #   TRUE                                   ~ taxonomy_super_class
+  # )) %>% 
+  # filter(number_sample_class > 5) %>% 
+  # filter(str_detect(taxonomy_super_class, "Lipids|acids")) %>%
+  mutate(is_lipids = case_when(
+    str_detect(taxonomy_super_class, "Lipids")              ~ "Yes",
+    TRUE                                                    ~ "No"
+  )) %>% 
+  dplyr::select(-number_sample_class, -taxonomy_super_class) %>% 
+  mutate_if(is.character, factor)
+```
+
+
+## Build a recipe
+We need to take a first look at the data
+
+### Is the data normalized?
+```{r}
+# skimr::skim(mldata)
+summary(mldata)
+```
+
+### Is the data balanced?
+```{r}
+mldata %>% 
+  ggplot(aes(x=is_lipids, fill= is_lipids))+
+  geom_bar()+
+  theme_minimal()
+```
+
+```{r}
+set.seed(123)
+
+# 1. Splitting the data
+# 3/4 of the data into the training set but split evenly winthin race
+data_split <- initial_split(mldata, prop = 3/4, strata = is_lipids)
+# Create training and testing datasets:
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+```
+
+### What are the steps to take?
+
+- Investigate if the data needs to be balanced and/or normalized :
+1- Normalize numeric data to have a standard deviation of one or *scale*.
+2- Normalize numeric data to have a standard deviation of one and a mean of zero *normalize*.
+3- Balanced outcomes with *smote*. This use nearest neighbor to create new synthetic observation almost similar.  
+
+So I initialize 5 machine learning recipes : balanced, scaled, normalized, balanced_scaled, balanced_normalized
+```{r recipe}
+recipe_smote <- 
+  recipe(is_lipids ~ ., data = train_data)  %>% 
+  update_role(hmdb, new_role = "ID") %>% 
+  # 3. Set differential steps
+  step_smote(is_lipids)
+
+recipe_scale <- 
+  # 1.model formula
+  recipe(is_lipids ~ ., data = train_data)  %>% 
+   # 2.keep these variables but not use them as either outcomes or predictors
+  update_role(hmdb, new_role = "ID") %>% 
+  # 3. Set differential steps
+  step_scale(all_numeric_predictors())
+
+recipe_norm <- 
+  recipe(is_lipids ~ ., data = train_data)  %>% 
+  update_role(hmdb, new_role = "ID") %>% 
+  # 3. Set differential steps
+  step_normalize(all_numeric_predictors())
+  
+recipe_scale_smote <- 
+  recipe(is_lipids ~ ., data = train_data)  %>% 
+  update_role(hmdb, new_role = "ID") %>% 
+  # 3. Set differential steps
+  step_scale(all_numeric_predictors()) %>% 
+  step_smote(is_lipids)
+
+recipe_norm_smote <- 
+  recipe(is_lipids ~ ., data = train_data)  %>% 
+  update_role(hmdb, new_role = "ID") %>% 
+  # 3. Set differential steps
+  step_normalize(all_numeric_predictors()) %>% 
+  step_smote(is_lipids)
+```
+
+```{r}
+recipe_list <- 
+list(balanced = recipe_smote, scaled = recipe_scale, normalized = recipe_norm,
+     balancedscaled = recipe_scale_smote, balancednormalized = recipe_norm_smote)
+#Generate List of Model Types
+```
+
+
+I will be using these 5 recipes on multiple classification models in order or evaluate the recipe / model with the best accuracy :
+
+- bayesian model, decision tree, support-vector machine, ramdom forest, boosted tree, logistic regression, nearest neighbor.
+
+We then will test these workflows on a training dataset.
+
+```{r}
+nb_spec <- 
+  naive_Bayes(smoothness = tune(), Laplace = tune()) %>% 
+  set_engine("klaR") %>% 
+  set_mode("classification")
+```
+
+```{r}
+dt_spec <- decision_tree(cost_complexity = tune(), tree_depth = tune(), min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+```
+
+```{r}
+svm_spec <- 
+  svm_rbf(cost = tune(), rbf_sigma = tune(), margin = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+```
+
+```{r rand_forest}
+set.seed(345)
+
+ranger_spec <- rand_forest(
+  mtry = tune(), 
+  min_n = tune(),
+  trees = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+```
+
+```{r xgboost}
+xgboost_spec <- 
+  boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), 
+             loss_reduction = tune(), sample_size = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost") 
+# xgboost_workflow <- 
+#   workflow() %>% 
+#   add_recipe(mldata_recipe) %>% 
+#   add_model(xgboost_spec) 
+# set.seed(345)
+# xgboost_tune <-
+#   tune_grid(xgboost_workflow, resamples = mldata_folds, grid = 10)
+```
+
+```{r}
+glmnet_spec <- 
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+# glmnet_workflow <- 
+#   workflow() %>% 
+#   add_recipe(mldata_recipe) %>% 
+#   add_model(glmnet_spec) 
+# glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), mixture = c(0, 0.05, 
+#                                                                                       0.2, 0.4, 0.6, 0.8, 1)) 
+# set.seed(345)
+# glmnet_tune <- 
+#   tune_grid(glmnet_workflow, resamples = mldata_folds, grid = glmnet_grid) 
+```
+
+```{r}
+knn_spec <- 
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn") 
+# knn_workflow <- 
+#   workflow() %>% 
+#   add_recipe(mldata_recipe) %>% 
+#   add_model(knn_spec) 
+# set.seed(345)
+# knn_tune <-
+#   tune_grid(knn_workflow, 
+#             resamples = mldata_folds, 20)
+```
+
+```{r}
+model_list <- 
+list(Random_Forest = ranger_spec, SVM = svm_spec, Naive_Bayes = nb_spec, 
+     Decision_Tree = dt_spec, Boosted_Trees = xgboost_spec, KNN = knn_spec, Logistic_Regression = glmnet_spec)
+```
+
+```{r}
+model_set <- workflow_set(preproc = recipe_list, models = model_list, cross = T)
+```
+
+### Machine learning data sets.
+
+The known metabolites data is split in to a training dataset (75%) and testing dataset (25%). The split is done evenly within the outcome variable `is_lipids`.
+
+- Use a 10 fold cross validation to train and evaluate model on the training set. Resampling procedure will allow us to fit each workflow to the training data and compute accuracy on each resample and take the mean to pick the best model / recipe cross combination.
+
+```{r}
+doParallel::registerDoParallel()
+set.seed(123)
+
+mldata_folds <- vfold_cv(train_data, strata = is_lipids)
+doParallel::registerDoParallel()
+all_workflows <- 
+  model_set %>% workflow_map(resamples = mldata_folds, 
+                             verbose = TRUE)
+```
+
+### Visualize performance comparison of workflows
+```{r}
+collect_metrics(all_workflows) %>% 
+  separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% 
+  filter(.metric == "accuracy") %>% 
+  group_by(wflow_id) %>% 
+  filter(mean == max(mean)) %>% 
+  group_by(model) %>% 
+  dplyr::select(-.config) %>% 
+  distinct() %>%
+  ungroup() %>% 
+  mutate(Workflow_Rank =  row_number(-mean),
+         .metric = str_to_upper(.metric)) %>%
+  mutate(Model_Type = factor(Model_Type, 
+                             levels = c("Random_Forest", "Logistic_Regression", 
+                                        "Decision_Tree", "Boosted_Trees",
+                                        "KNN", "SVM", "Naive_Bayes"))) %>% 
+  ggplot(aes(x=Workflow_Rank, y = mean, shape = Recipe, color = Model_Type)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean-std_err, ymax = mean+std_err)) +
+  geom_hline(aes(yintercept = 0.918), color= "darkgrey", linetype= 2)+
+  theme_minimal()+
+  scale_colour_brewer(palette = "Set1")+
+  # scale_colour_viridis_d() +
+  labs(title = "Performance Comparison of Workflow Sets", x = "Workflow Rank", y = "Accuracy", color = "Model Types", shape = "Recipes")
+
+collect_metrics(all_workflows) %>% 
+  separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% 
+  filter(.metric == "accuracy") %>% 
+  group_by(wflow_id) %>% 
+  filter(mean == max(mean)) %>% 
+  group_by(model) %>% 
+  dplyr::select(-.config) %>% 
+  distinct() %>%
+  ungroup() %>% 
+  mutate(Workflow_Rank =  row_number(-mean),
+         .metric = str_to_upper(.metric)) %>%
+  mutate(Model_Type = factor(Model_Type, 
+                             levels = c("Random_Forest", "Logistic_Regression", 
+                                        "Decision_Tree", "Boosted_Trees",
+                                        "KNN", "SVM"))) %>% 
+  filter(!is.na(Model_Type)) %>% 
+  ggplot(aes(x=Recipe, y = mean, shape = Recipe, color = Model_Type)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean-std_err, ymax = mean+std_err),
+                width = 0.1) +
+  geom_hline(aes(yintercept = 0.918), color= "darkgrey", linetype= 2)+
+  theme_minimal()+
+  scale_colour_brewer(palette = "Set1")+
+  # scale_colour_viridis_d() +
+  labs(title = "Performance Comparison of Workflow Sets", x = "Workflow Rank", y = "Accuracy", color = "Model Types", shape = "Recipes")+
+  facet_wrap(. ~ Model_Type)
+```
+
+
+
+
+
+
+
+
+
