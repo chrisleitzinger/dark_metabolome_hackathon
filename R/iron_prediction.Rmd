@@ -1,0 +1,151 @@
+---
+title: "Machine learning models using workflowsets to classify unknown metabolites as lipids or not"
+author: "Christelle Colin-Leitzinger"
+date: '`r Sys.Date()`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: united
+    highlight: pygments
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+.figure {
+   margin-top: 25px;
+   margin-bottom: 10px;
+}
+
+table {
+    margin-top: 10px;
+    margin-bottom: 25px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = FALSE,
+                      fig.align='center'
+                      )
+```
+
+
+```{r library}
+library(tidyverse)
+library(ComplexHeatmap)
+library(corrplot)
+library(ggcorrplot)
+library(tidymodels)
+library(themis)
+library(discrim)
+library(klaR)
+library(rpart.plot)
+library(vip) 
+```
+
+
+```{r load}
+# Samples, retention time and m/z data
+omics_data <- read_delim(paste0(here::here(), "/new_process_iron_log2_merged.txt")) %>% 
+  janitor::clean_names()
+#
+metabolites_data <- read_delim(paste0(here::here(), "/hmdb_keep_v4_python_blessed.txt.zip")) %>% 
+  janitor::clean_names()
+```
+
+```{r merge clean data}
+unknown_metabolites <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag != 1) %>% 
+  dplyr::select(hmdb, row_id, 
+         row_m_z, row_retention_time,
+         starts_with("t"))
+
+known_metabolites <- omics_data %>% 
+  # Filter identified metabolites
+  filter(non_heavy_identified_flag == 1 & !is.na(hmdb) & !str_detect(hmdb, "\\|")) %>% 
+  # cleaning retention time to eliminate false detection during set up, washing and equilibrating the HPLC
+  filter(row_retention_time > 0.5 & row_retention_time < 14)
+
+mldata <- known_metabolites %>% 
+  # Join with known metabolites
+  inner_join(., metabolites_data %>% 
+              dplyr::select(accession, taxonomy_super_class),
+            by = c("hmdb" = "accession")) %>% 
+  filter(!is.na(taxonomy_super_class)) %>% 
+  mutate(is_lipids = case_when(
+    str_detect(taxonomy_super_class, "Lipids")              ~ "Yes",
+    TRUE                                                    ~ "No"
+  ))
+```
+
+
+# **In the html, you can find the prediction of unknown metabolites using Samples, retention time and m/z information as predictors in part I and using retention time and m/z information alone as predictors in part II.**
+We are trying to predict metabolite classifications. In our proteomic analysis, about 88% of the metabolites are not identified. We want to see if we can predict with a good accuracy the classification of these metabolites based on **retention time and m/z** information (Part II). We also want to assess if using **patients samples as predictors** in addition to theses 2 parameters can increase the prediction (Part I).  
+<br>
+
+***
+<br>
+
+# I. Prediction using Samples, retention time and m/z information as predictors.
+
+
+## 1. Data preprocessing
+
+- We are focusing on predicting if a metabolite is a **lipid**, **Yes/No**. I am using a variable I created, `is_lipids`, as the outcome.
+
+- Patient samples present NO missing values :
+
+### Missing data
+```{r}
+library(finalfit) 
+
+known_metabolites %>%
+  dplyr::select(starts_with("t")) %>% 
+  ff_glimpse()
+```
+We have duplicated hmdb (positive and negative)
+```{r}
+known_metabolites %>%
+  separate(row_id, into = c("charge", "id")) %>% 
+  mutate(id = as.character(id)) %>% 
+  ggplot(aes(x=charge, y=id, fill= charge))+
+  geom_tile()+
+  theme_classic()
+```
+
+```{r}
+known_metabolites %>%
+  separate(row_id, into = c("charge", "id")) %>% 
+  filter(duplicated(id)) %>% 
+  full_join(., omics_data %>%
+              separate(row_id, into = c("charge", "id")) %>% 
+              filter(!duplicated(id)),
+            by="id") %>% 
+  dplyr::select(charge.x, id, charge.y) %>% 
+  filter(is.na(charge.x) | is.na(charge.y)) %>% 
+  pivot_longer(cols = c(charge.x, charge.y)) %>% 
+  filter(!is.na(value)) %>% 
+  ggplot(aes(x=value, fill= value))+
+  geom_bar()+
+  theme_classic()
+```
+The data is imputed with minimum of the expression after selecting for negative metabolites.
+
+```{r data prep}
+mldata <- mldata %>% 
+  # filter metabolites in positive or negative detection
+  filter(str_detect(row_id, "neg")) %>% 
+  # Imputation samples data
+  mutate(across((starts_with("t")), .fns = ~ replace_na(., min(., na.rm = TRUE)))) %>% 
+  mutate_if(is.character, factor) %>% 
+  dplyr::select(hmdb, row_m_z, row_retention_time, 
+                starts_with("t"))
+```
+

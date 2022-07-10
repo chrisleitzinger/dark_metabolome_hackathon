@@ -38,6 +38,9 @@ knitr::opts_chunk$set(echo = FALSE,
 
 ```{r library}
 library(tidyverse)
+library(ComplexHeatmap)
+library(corrplot)
+library(ggcorrplot)
 library(tidymodels)
 library(themis)
 library(discrim)
@@ -128,6 +131,63 @@ Let's take a first look at the data
 # skimr::skim(mldata)
 summary(mldata)
 ```
+
+```{r, fig.height=12, fig.width=12}
+map_df <- mldata %>% 
+  distinct(hmdb, .keep_all = TRUE)
+  
+map_df1 <- map_df %>%
+  unite(metabolite, c(hmdb, is_lipids), sep = "_", remove = TRUE) %>%
+  `row.names<-`(.$metabolite) %>% 
+  dplyr::select(-metabolite)
+
+df_map <- t(scale(as.matrix(map_df1))) # scale for standardizing the data to make variables comparable
+column_ho = HeatmapAnnotation(is_lipids = c(map_df$is_lipids),
+                              col = list(is_lipids = c("Yes" = "#932667FF", "No" = "grey")),
+    na_col = "black")
+Heatmap(df_map, name = " ",
+        # cluster_rows = FALSE, cluster_columns = FALSE#,
+        top_annotation = column_ho
+        )
+```
+
+```{r, fig.height=12, fig.width=12}
+a <- map_df1
+mat <- cor(a, use = "pairwise.complete.obs")
+ggcorrplot(mat, hc.order = TRUE, # method = "circle", 
+           outline.color = "white",
+           colors = c("white", "#6D9EC1", "#E46726"),
+           type = "lower", 
+           # lab = TRUE,
+           title = "Correlation between metabolites features and samples",
+           show.legend = TRUE, legend.title = "Correlation",
+           # lab_col = "lightgrey", lab_size = 1, 
+           # sig.level = 0.05, insig = c("pch", "blank"), pch = 4, pch.col = "black", pch.cex = 10, 
+           # tl.cex = 10, tl.col = "red", tl.srt = 40,
+           # digits = 2
+)
+```
+
+
+```{r}
+a <- map_df1 %>% dplyr::select(row_m_z, row_retention_time, x06s19028675)
+mat <- cor(a, use = "pairwise.complete.obs")
+ggcorrplot(mat, hc.order = TRUE, # method = "circle", 
+           outline.color = "white",
+           colors = c("white", "#6D9EC1", "#E46726"),
+           type = "lower", 
+           lab = TRUE,
+           title = "Correlation between metabolites features and samples",
+           show.legend = TRUE, legend.title = "Correlation",
+           # lab_col = "darkblue", lab_size = 3, 
+           # sig.level = 0.05, insig = c("pch", "blank"), pch = 4, pch.col = "black", pch.cex = 10, 
+           # tl.cex = 10, tl.col = "red", tl.srt = 40,
+           # digits = 2
+)
+```
+
+
+
 
 ### Is the data balanced? **No**
 ```{r}
