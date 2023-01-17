@@ -592,12 +592,11 @@ performance_workflows <- collect_metrics(all_workflows) %>%
 two_predictor_perfmean <- performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "n2_Decision_Tree") %>% dplyr::select(mean)
 two_predictor_perfsd <- performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "n2_Decision_Tree") %>% dplyr::select(std_err)
 ```
-**Best model and recipe**
-The best 2 models are 
-- `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Random_Forest") %>% dplyr::select(Model_Type))` with an accurracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Random_Forest") %>% dplyr::select(mean))`.  
-- `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Decision_Tree") %>% dplyr::select(Model_Type))` with an accuracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Decision_Tree") %>% dplyr::select(mean))`.  
-<span style="color:green">Although random forest perform better, we decided to move forward with a simpler model which is the Trimmed decision tree. The measured accuracy is within the SD of the 2 models performing better.</span>  
-- `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "n2_Decision_Tree") %>% dplyr::select(Model_Type))` with an accuracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "n2_Decision_Tree") %>% dplyr::select(mean))`.   
+**Best model and recipe**  
+The best 2 models are:  
+- Random_Forest with an accurracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Random_Forest") %>% dplyr::select(mean))`.  
+- Decision_Tree with an accuracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Decision_Tree") %>% dplyr::select(mean))`.  
+<span style="color:green">Although random forest perform better, we decided to move forward with a simpler model which is the Trimmed decision tree. The measured accuracy is within the SD of the 2 models performing better aka an accuracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "n2_Decision_Tree") %>% dplyr::select(mean))`.</span>     
 ```{r, fig.width=12, fig.height=6}
 collect_metrics(all_workflows) %>%
   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>%
@@ -663,7 +662,7 @@ final_knn <- all_workflows %>%
   select_best(metric = "accuracy"))
 ```
 
-These are the hyperpareameters values used by the 2 best models (added the RF and knn just for reference).
+These are the hyperpareameters values used (added the RF and knn just for reference).
 ```{r hyperpareameters}
 final_n2_tree
 final_rf
@@ -729,15 +728,7 @@ n2_tree_results %>% # Compare both models
   theme_classic()+
   scale_fill_viridis_d(option = "A", begin= 0.2, end = 0.8)
 ```
-<span style="color:green">roc-auc and accuracy show a really good performance. The sensitivity (ability to detect a true positive) is good but both models suffer from small number of lipid observation in the data which leads to a lower specificity (No lipids are classified as lipids).</span>
-
-While ROC shows how the TPR and FPR vary with the threshold, the ROC AUC is a measure of the classification model's ability to distinguish one class from the other.
-
-### PR
-
-PR curves are sensitive to which class is defined as positive, unlike the ROC curve which is a more balanced method. So we will get a completely different result depending on which class is set as positive.
-PR curves are sensitive to class distribution, so if the ratio of positives to negatives changes across different analyses, then the PR curve cannot be used to compare performance between them. This is because the chance line varies between datasets with different class distributions.
-PR curves, because they use precision, instead of specificity (like ROC) can pick up false positives in the predicted positive fraction. This is very helpful when negatives >> positives. In these cases, the ROC is pretty insensitive and can be misleading, whereas PR curves reign supreme.
+<span style="color:green">roc-auc and accuracy show a really good performance. The sensitivity (ability to detect a true positive) is good but the models suffer from small number of lipid observation in the data which leads to a lower specificity (No lipids are classified as lipids).</span>
 
 ```{r evaluate models}
 n2_tree_results %>% # Compare both models
@@ -772,9 +763,18 @@ n2_tree_results %>% # Compare both models
   group_by(model) %>%
   roc_auc(is_lipids, .pred_No)
 ```
-<span style="color:green">The roc-auc curve and value are very similar between the 2 models.</span>
+<span style="color:green">The roc-auc curve for the decision tree model is lower than other models.</span>
+While ROC shows how the TPR and FPR vary with the threshold, the ROC AUC is a measure of the classification model's ability to distinguish one class from the other. So ROC is not as reliable for unbalanced data.
 
-Precision-Recall is a useful measure of success of prediction when the classes are very imbalanced.
+### PR
+
+PR curves are sensitive to which class is defined as positive, unlike the ROC curve which is a more balanced method. So we will get a completely different result depending on which class is set as positive.
+PR curves are sensitive to class distribution, so if the ratio of positives to negatives changes across different analyses, then the PR curve cannot be used to compare performance between them. This is because the chance line varies between datasets with different class distributions.
+PR curves, because they use precision, instead of specificity (like ROC) can pick up false positives in the predicted positive fraction. This is very helpful when negatives >> positives. In these cases, the ROC is pretty insensitive and can be misleading, whereas PR curves reign supreme.
+
+
+
+Precision-Recall is a useful measure of success of prediction when the classes are **very imbalanced**.
 precision is a measure of result relevancy, while recall is a measure of how many truly relevant results are returned.
 
 The precision-recall curve shows the tradeoff between precision and recall for different threshold. A high area under the curve represents both high recall and high precision, where high precision relates to a low false positive rate, and high recall relates to a low false negative rate.
@@ -830,14 +830,13 @@ n2_tree_results %>% # Compare both models
   group_by(model) %>%
   average_precision(is_lipids, .pred_No)
 ```
-<span style="color:green">I never used PR measurement so I would love to hear your input.</span>
-For what I can see here, the prediction for No is very precise when the prediction for Yes is less precise:
-<span style="color:green">For RF, high recall but low precision : returns many results, but 32% of the lipids Yes prediction are incorrect. Only 2.5% are predicted wrongly as lipids No.</span>
+<span style="color:green">For what I can see here, the prediction for No is very precise when the prediction for Yes is less precise.</span>  
+<span style="color:green">The decision tree exhibit a better measurement of PR.</span>
 <br>
 <br>
 
 
-# Fit on the whole training / predict on testing data
+# 4. Fit on the whole training / predict on testing data
 ## Analyse results
 ```{r}
 set.seed(789)
@@ -886,6 +885,7 @@ collect_metrics(final_fit) %>%
                 position=position_dodge(width=0.9))+
   scale_fill_viridis_d(option = "A", begin= 0.2, end = 0.8)
 ```
+
 ## 2.Get predictions out on the testing dataset
 ```{r}
 df <- final_fit %>%
@@ -943,7 +943,7 @@ final_fit %>%
   facet_wrap(. ~ is_lipids, ncol = 2)
 ```
 
-# Prediction on new data with Trimmed Decision Tree
+# 5. Prediction on new data with Trimmed Decision Tree
 The new data is cleaned in the same manner as the data used to create the machine learning model.  
 - keep row_retention_time > 0.5 & < 14  
 - keep only metabolite row entry when positive and negative metabolites are present
