@@ -65,14 +65,18 @@ omics1799_data <-
   read_delim(
     paste0(
       here::here(), 
-      "/flores_1799_tap73_metabolomics_reanalysis_2023-04-03/flores_1799_tap73_metabolomics_reanalysis_2023_iron_log2_merged.txt")) %>% 
+      "/flores_1799_tap73_metabolomics_reanalyze_2023-08-17/flores_1799_tap73_metabolomics_reanalysis_2023-08-17_iron_log2_merged.txt")) %>% 
   janitor::clean_names()
 #
-validation3990_data <- read_csv(paste0(here::here(), "/CICPT_3990_tissue_metabolomics_iron_log2_merged_edited.csv")) %>% 
+validation3990_data <- 
+  read_delim(
+    paste0(
+      here::here(), 
+      "/flores_3990_metabolomics_tissue_2023-08-17/flores_3990_metabolomics_tissue_iron_log2_merged.txt")) %>% 
   janitor::clean_names()
 ```
 
-## **In the html, you can find the prediction of unknown metabolites using buffer_percent and m/z information alone as predictors in part I and using Samples, buffer_percent and m/z information as predictors in part II (data not shown?).**
+### **In the html, you can find the prediction of unknown metabolites using buffer_percent and m/z information alone as predictors in part I and using Samples, buffer_percent and m/z information as predictors in part II (data not shown?).**
 
 <br>
 
@@ -90,6 +94,15 @@ In the raw data, we observe metabolites before 1 and after 14 for row_retention_
 <div class = "col-md-6">
 #### Before cleaning
 ```{r}
+omics1799_data %>% 
+  mutate(row_retention_time = round(row_retention_time, 1)) %>% 
+  ggplot(aes(x= row_retention_time))+
+  geom_bar(stat = "count")+
+  geom_vline(aes(xintercept= 1), color= "blue")+
+  geom_vline(aes(xintercept= 14), color= "blue")+
+  xlim(0, 15)+
+  theme_classic()
+
 omics1799_data %>% 
   ggplot(aes(x= row_retention_time, y=row_m_z
              ))+
@@ -384,6 +397,9 @@ unknown_metabolites <- full_data %>%
 ```
 
 ```{r data prep}
+# full_data <- full_data %>% 
+#   mutate(is_lipids = relevel(is_lipids, "Yes"))
+
 two_predictor_data <- full_data %>%
   # Filter identified metabolites
   filter(non_heavy_identified_flag == 1) %>%
@@ -403,6 +419,8 @@ sample_predictor_data <- full_data %>%
 ## Is the data balanced? **No**
 - We are focusing on predicting if a metabolite is a **lipid Yes/No**. 
 ```{r}
+str(two_predictor_data)
+
 two_predictor_data %>%
   ggplot(aes(x=is_lipids, fill= is_lipids))+
   geom_bar()
@@ -633,20 +651,25 @@ mldata_folds <- vfold_cv(train_data, strata = is_lipids)
 
 # 4. Train on the training dataset of 1799
 ```{r run workflows}
+class_metric <- metric_set(accuracy, roc_auc, recall, precision, #pr_auc, 
+                           sensitivity, specificity)
+
 doParallel::registerDoParallel()
 set.seed(1234)
 all_workflows <-
-  model_set %>% workflow_map(resamples = mldata_folds,
-                             verbose = TRUE)
+  model_set %>% workflow_map(resamples = mldata_folds, 
+                             metrics = class_metric,
+                             verbose = TRUE,
+                             control = control_resamples(save_pred = TRUE))
 ```
 
-## 4. Visualize performance comparison of combined workflows - Explore Tuning param
+## 1. Visualize performance comparison of combined workflows - Explore Tuning param
 ```{r, fig.width=12, fig.height=12}
 collect_metrics(all_workflows) %>%
   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>%
   filter(.metric == "accuracy") %>%
   group_by(wflow_id) %>%
-  filter(mean == max(mean)) %>%
+  filter(mean == max(mean)) %>% # equivalent to select_best after tuning
   group_by(model) %>%
   dplyr::select(-.config) %>%
   distinct() %>%
@@ -684,15 +707,105 @@ collect_metrics(all_workflows) %>%
   labs(title = "Performance Comparison of Workflow Sets", x = "Workflow Rank",
        y = "Accuracy", color = "Models", shape = "Recipes")
 
+
+compare_all <- collect_metrics(all_workflows) %>%
+  separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% 
+  filter(Recipe == "basic") %>% 
+  group_by(wflow_id, .metric) %>%
+  mutate(selected_model = case_when(
+    .metric == "accuracy" &
+      mean == max(mean)            ~ "selected"
+  )) %>% 
+  filter(selected_model == "selected") %>% 
+  group_by(model) %>%
+  distinct(pick(!contains(".config")), .keep_all = TRUE) %>%
+  ungroup()
+
+prauc_data <- collect_predictions(all_workflows, summarize = FALSE) %>% 
+  separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>%
+  filter(Recipe == "basic") %>%
+  left_join(compare_all %>% 
+              dplyr::select(wflow_id, .config, .estimator, Model_Type), .,
+            by = c("wflow_id", ".config", "Model_Type"))
+prauc_data1 <- prauc_data %>% 
+  group_by(wflow_id, Recipe, Model_Type, id) %>%
+  pr_auc(is_lipids, .pred_No, event_level = "first") %>% 
+  group_by(wflow_id, Recipe, Model_Type) %>%
+  summarize(mean = mean(`.estimate`),
+            std_err = sd(`.estimate`)) %>% 
+    mutate(`.metric` = "pr_auc_No") %>% 
+  ungroup()
+prauc_data2 <- prauc_data %>% 
+  group_by(wflow_id, Recipe, Model_Type, id) %>%
+  pr_auc(is_lipids, .pred_Yes, event_level = "first") %>% 
+  group_by(wflow_id, Recipe, Model_Type) %>%
+  summarize(mean = mean(`.estimate`),
+            std_err = sd(`.estimate`)) %>% 
+  mutate(`.metric` = "pr_auc_Yes") %>% 
+  ungroup()
+
+compare_all <- collect_metrics(all_workflows) %>%
+  separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% 
+  filter(Recipe == "basic") %>% 
+  left_join(compare_all %>% 
+              dplyr::select(wflow_id, .config, Model_Type), .,
+            by = c("wflow_id", ".config", "Model_Type")) %>% 
+  bind_rows(prauc_data1, prauc_data2, .)
+rm(prauc_data, prauc_data1, prauc_data2)
+
+
+d <- compare_all %>% 
+  dplyr::select(wflow_id, .metric, mean) %>% 
+  mutate(mean = round(mean, 3)) %>% 
+  # group_by(wflow_id) %>% 
+  pivot_wider(id_cols = wflow_id, 
+              names_from = .metric, 
+              values_from = mean) %>% 
+  mutate(id = c(4, 1, 5, 8, 7, 10, 3, 6, 9, 2)) %>% 
+  arrange(id) %>% 
+  dplyr::select(wflow_id, pr_auc_No, pr_auc_Yes, accuracy, sensitivity,
+         specificity, precision, recall, roc_auc)
+
+library(kableExtra)
+library(formattable)
+d %>% 
+  mutate(pr_auc_No = ifelse(pr_auc_No > 0.93,
+                  cell_spec(pr_auc_No, background = "lightgreen"),
+                  cell_spec(pr_auc_No)
+                  ),
+         pr_auc_Yes = ifelse(pr_auc_Yes > 0.61,
+                  cell_spec(pr_auc_Yes, background = "lightgreen"),
+                  cell_spec(pr_auc_Yes)
+                  ),
+         accuracy = ifelse(accuracy > 0.87,
+                  cell_spec(accuracy, background = "lightgreen"),
+                  cell_spec(accuracy)
+                  ),
+         sensitivity = ifelse(sensitivity > 0.95,
+                  cell_spec(sensitivity, background = "lightgreen"),
+                  cell_spec(sensitivity)
+                  ),
+         specificity = ifelse(specificity > 0.6,
+                  cell_spec(specificity, background = "lightgreen"),
+                  cell_spec(specificity)
+                  )
+         ) %>% 
+  kableExtra::kable(escape = F) %>%
+  kableExtra::kable_classic(full_width = T, html_font = "Cambria", font_size = 16) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
 performance_workflows <- collect_metrics(all_workflows) %>%
   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>%
   filter(.metric == "accuracy") %>%
+  filter(Recipe == "basic") %>% 
   group_by(wflow_id) %>%
-  filter(mean == max(mean)) %>%
-  # group_by(model) %>%
-  # dplyr::select(-.config) %>%
-  # distinct() %>%
+  filter(mean == max(mean)) %>% # equivalent to select_best after tuning
+  group_by(model) %>%
+  dplyr::select(-.config) %>%
+  distinct() %>%
   ungroup()
+
 
 two_predictor_perfmean_DT <- 
   performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% 
@@ -709,8 +822,9 @@ two_predictor_perfsd_n2DT <-
 ```
 **Best model and recipe**  
 The best models:  
-<!-- - Random_Forest with an accurracy of `r as.character(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Random_Forest") %>% dplyr::select(mean))`.   -->
-- Decision_Tree with an accuracy of `r as.character(round(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "Decision_Tree") %>% dplyr::select(mean),3))`.  
+- Decision Tree with the highest accuracy. Area under the curve for the precision-recall and metrics sensitivity are not very high, but still good good. Moreover, it displays one of the highest specificity.  
+- Random forest with the second highest accuracy. Random Forest metrics follow the values for the decision tree model but with a better area under the curve for the precision-recall metrics.   
+- Trimmed Decision Tree with the seventh highest accuracy. **Trimmed decision tree show an area under the curve for the precision-recall metric a little higher for No lipid prediction but a lower value for Yes predictions. The sensitivity is within the highest, and the specificity metric is within lowest.**  
 <!-- <span style="color:green">We decided to move forward with a simpler model which is the Trimmed decision tree. The measured accuracy is `r as.character(round(performance_workflows %>% distinct(Model_Type, .keep_all = TRUE) %>% filter(Model_Type == "n2_Decision_Tree") %>% dplyr::select(mean),2))`.</span>      -->
 ```{r, fig.width=12, fig.height=12}
 collect_metrics(all_workflows) %>%
@@ -788,48 +902,52 @@ final_knn <- all_workflows %>%
   select_best(metric = "accuracy"))
 ```
 
-These are the hyperpareameters values used:
-```{r hyperpareameters}
-final_tree
-final_rf
-# final_n2_tree
-# final_knn
-```
+<!-- These are the hyperpareameters values used: -->
+<!-- ```{r hyperpareameters} -->
+<!-- final_tree -->
+<!-- final_n2_tree -->
+<!-- final_rf -->
+<!-- # final_knn -->
+<!-- ``` -->
 
-## 5.Evaluate the best models in depth on training set
-### roc_auc, accuracy, sensitivity, specificity, precision
+## 2.Evaluate the best models (best accuracy) in depth on full training set
 ```{r fit_resamples}
 set.seed(1234)
 n2_tree_results <- final_n2_tree %>%
   fit_resamples(
     resamples = mldata_folds,
-    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall),
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc
+                         ),
     control = control_resamples(save_pred = TRUE, verbose = TRUE)
   )
 set.seed(1234)
 tree_results <- final_tree %>%
   fit_resamples(
     resamples = mldata_folds,
-    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall),
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc
+                         ),
     control = control_resamples(save_pred = TRUE, verbose = TRUE)
   )
 set.seed(1234)
 rf_results <- final_rf %>%
   fit_resamples(
     resamples = mldata_folds,
-    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall),
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc
+                         ),
     control = control_resamples(save_pred = TRUE, verbose = TRUE)
   )
 set.seed(1234)
 knn_results <- final_knn %>%
   fit_resamples(
     resamples = mldata_folds,
-    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc
+                         ),
     control = control_resamples(save_pred = TRUE)
   )
 ```
 <br>
 
+### accuracy, roc_auc, sensitivity, specificity, precision, recall
 ```{r Performance Metrics}
 n2_tree_results %>% # Compare both models
   collect_metrics() %>%
@@ -839,10 +957,11 @@ n2_tree_results %>% # Compare both models
               dplyr::select(".metric", rf_mean = mean), by = ".metric") %>%
   full_join(., tree_results %>% 
               collect_metrics() %>%
-              dplyr::select(".metric", tree_mean = mean), by = ".metric")
-  # full_join(., knn_results %>%
-  #             collect_metrics() %>%
-  #             dplyr::select(".metric", knn_mean = mean), by = ".metric")
+              dplyr::select(".metric", tree_mean = mean), by = ".metric") %>% 
+  full_join(., knn_results %>%
+              collect_metrics() %>%
+              dplyr::select(".metric", knn_mean = mean), by = ".metric") %>% 
+  mutate(across(where(is.numeric), ~ round(., 3)))
 
 n2_tree_results %>% # Compare both models
   collect_metrics() %>%
@@ -850,14 +969,13 @@ n2_tree_results %>% # Compare both models
   bind_rows(rf_results %>%
               collect_metrics() %>%
               mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
+  bind_rows(., tree_results %>% 
               collect_metrics() %>%
               mutate(model = "tree")) %>%
-  mutate(model = factor(model, levels= c("tree", "rf",
-                                         "n2_tree"))) %>% 
-  # bind_rows(knn_results %>%
-  #             collect_metrics() %>%
-  #             mutate(model = "knn")) %>%
+  bind_rows(knn_results %>%
+              collect_metrics() %>%
+              mutate(model = "knn")) %>%
+  mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>% 
 
   ggplot(aes(x= .metric, y=mean, fill = model))+
   geom_bar(stat = "identity",
@@ -867,12 +985,11 @@ n2_tree_results %>% # Compare both models
                     ymax = mean + std_err),
                 width = 0.2, alpha = 0.5,
                 position=position_dodge(width=0.9))+
-  theme_classic()+
-  scale_fill_manual(values = c("#8DA0CB", "#FC8D62", "#66C2A5"), 
+  scale_fill_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5"), 
                     name= NULL)
   # scale_fill_viridis_d(option = "A", begin= 0.2, end = 0.8)
 ```
-<span style="color:green">roc-auc and accuracy show a really good performance. The sensitivity (ability to detect a true positive) is good but the models suffer from small number of lipid observation in the data which leads to a lower specificity (No lipids are classified as lipids).</span>
+<span style="color:green">The 4 models show a really good performance for all metrics but specificity. The sensitivity (ability to detect a true positive) is really good but the models suffer from small number of lipid observation in the data which leads to a lower specificity (No lipids are classified as lipids). This is especially observed for the trimmed decision tree. Of note, ROC_AUC is also lower for the trimmed decision tree but it is not the best metric to make a decision in the case of unbalanced data.</span>
 
 ```{r evaluate models roc}
 n2_tree_results %>% # Compare both models
@@ -881,15 +998,14 @@ n2_tree_results %>% # Compare both models
   bind_rows(rf_results %>%
               collect_predictions() %>%
               mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
+  bind_rows(., tree_results %>% 
               collect_predictions() %>%
               mutate(model = "tree")) %>%
-  mutate(model = factor(model, levels= c("tree", "rf",
-                                         "n2_tree"))) %>% 
-  # bind_rows(knn_results %>%
-  #             collect_predictions() %>%
-  #             mutate(model = "knn")) %>%
-  
+  bind_rows(knn_results %>%
+              collect_predictions() %>%
+              mutate(model = "knn")) %>%
+  mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>% 
+
 # rf_results %>% # Compare both models
 #   collect_predictions() %>%
 #   mutate(model = "rf") %>%
@@ -899,38 +1015,38 @@ n2_tree_results %>% # Compare both models
   group_by(model) %>%
   roc_curve(is_lipids, .pred_No) %>%
   autoplot()+
-  scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#66C2A5"), name= NULL)+
+  scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5"), name= NULL)+
   ggtitle("Area under Curve ROC (Receiver Operating Characteristics)")
-n2_tree_results %>% # Compare both models
-  collect_predictions() %>%
-  mutate(model = "n2_tree") %>%
-  bind_rows(rf_results %>%
-              collect_predictions() %>%
-              mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
-              collect_predictions() %>%
-              mutate(model = "tree")) %>%
-  # bind_rows(knn_results %>%
-  #             collect_predictions() %>%
-  #             mutate(model = "knn")) %>%
-  group_by(model) %>%
-  roc_auc(is_lipids, .pred_No)
+# n2_tree_results %>% # Compare both models
+#   collect_predictions() %>%
+#   mutate(model = "n2_tree") %>%
+#   bind_rows(rf_results %>%
+#               collect_predictions() %>%
+#               mutate(model = "rf")) %>%
+#   full_join(., tree_results %>% 
+#               collect_predictions() %>%
+#               mutate(model = "tree")) %>%
+#   # bind_rows(knn_results %>%
+#   #             collect_predictions() %>%
+#   #             mutate(model = "knn")) %>%
+#   group_by(model) %>%
+#   roc_auc(is_lipids, .pred_No)
 ```
 <!-- <span style="color:green">The roc-auc curve for the decision tree model is lower than other models.</span> -->
-While ROC shows how the TPR and FPR vary with the threshold, the ROC AUC is a measure of the classification model's ability to distinguish one class from the other. So ROC is not as reliable for unbalanced data.
+*While ROC shows how the TPR and FPR vary with the threshold, the ROC AUC is a measure of the classification model's ability to distinguish one class from the other. So ROC is not as reliable for unbalanced data.*
 
 ### PR
 
-PR curves are sensitive to which class is defined as positive, unlike the ROC curve which is a more balanced method. So we will get a completely different result depending on which class is set as positive.
-PR curves are sensitive to class distribution, so if the ratio of positives to negatives changes across different analyses, then the PR curve cannot be used to compare performance between them. This is because the chance line varies between datasets with different class distributions.
-PR curves, because they use precision, instead of specificity (like ROC) can pick up false positives in the predicted positive fraction. This is very helpful when negatives >> positives. In these cases, the ROC is pretty insensitive and can be misleading, whereas PR curves reign supreme.
+<!-- PR curves are sensitive to which class is defined as positive, unlike the ROC curve which is a more balanced method. So we will get a completely different result depending on which class is set as positive. -->
+<!-- PR curves are sensitive to class distribution, so if the ratio of positives to negatives changes across different analyses, then the PR curve cannot be used to compare performance between them. This is because the chance line varies between datasets with different class distributions. -->
+<!-- PR curves, because they use precision, instead of specificity (like ROC) can pick up false positives in the predicted positive fraction. This is very helpful when negatives >> positives. In these cases, the ROC is pretty insensitive and can be misleading, whereas PR curves reign supreme. -->
 
 
 
 Precision-Recall is a useful measure of success of prediction when the classes are **very imbalanced**.
-precision is a measure of result relevancy, while recall is a measure of how many truly relevant results are returned.
+<!-- precision is a measure of result relevancy, while recall is a measure of how many truly relevant results are returned. -->
 
-The precision-recall curve shows the tradeoff between precision and recall for different threshold. A high area under the curve represents both high recall and high precision, where high precision relates to a low false positive rate, and high recall relates to a low false negative rate.
+<!-- The precision-recall curve shows the tradeoff between precision and recall for different threshold. A high area under the curve represents both high recall and high precision, where high precision relates to a low false positive rate, and high recall relates to a low false negative rate. -->
 
 ```{r evaluate models pr}
 n2_tree_results %>% # Compare both models
@@ -939,17 +1055,17 @@ n2_tree_results %>% # Compare both models
   bind_rows(rf_results %>%
               collect_predictions() %>%
               mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
+  bind_rows(., tree_results %>% 
               collect_predictions() %>%
               mutate(model = "tree")) %>%
-  mutate(model = factor(model, levels= c("tree", "rf", "n2_tree"))) %>% 
-  # bind_rows(knn_results %>%
-  #             collect_predictions() %>%
-  #             mutate(model = "knn")) %>%
+  bind_rows(knn_results %>%
+              collect_predictions() %>%
+              mutate(model = "knn")) %>%
+  mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>% 
   group_by(model) %>%
   pr_curve(is_lipids, .pred_Yes) %>%
   autoplot()+
-  scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#66C2A5"), name= NULL)+
+  scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5"), name= NULL)+
   ggtitle("Area under the precision recall curve - \nYes prediction")
 n2_tree_results %>% # Compare both models
   collect_predictions() %>%
@@ -957,14 +1073,17 @@ n2_tree_results %>% # Compare both models
   bind_rows(rf_results %>%
               collect_predictions() %>%
               mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
+  bind_rows(., tree_results %>% 
               collect_predictions() %>%
               mutate(model = "tree")) %>%
-  # bind_rows(knn_results %>%
-  #             collect_predictions() %>%
-  #             mutate(model = "knn")) %>%
+  bind_rows(knn_results %>%
+              collect_predictions() %>%
+              mutate(model = "knn")) %>%
   group_by(model) %>%
-  average_precision(is_lipids, .pred_Yes)
+  pr_auc(is_lipids, .pred_Yes) %>% 
+  mutate(.metric = "pr_auc_Yes") %>% 
+  arrange(-.estimate) %>% 
+  mutate(across(where(is.numeric), ~ round(., 3)))
 
 n2_tree_results %>% # Compare both models
   collect_predictions() %>%
@@ -972,17 +1091,17 @@ n2_tree_results %>% # Compare both models
   bind_rows(rf_results %>%
               collect_predictions() %>%
               mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
+  bind_rows(., tree_results %>% 
               collect_predictions() %>%
               mutate(model = "tree")) %>%
-  mutate(model = factor(model, levels= c("tree", "rf", "n2_tree"))) %>% 
-  # bind_rows(knn_results %>%
-  #             collect_predictions() %>%
-  #             mutate(model = "knn")) %>%
+  bind_rows(knn_results %>%
+              collect_predictions() %>%
+              mutate(model = "knn")) %>%
+  mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>% 
   group_by(model) %>%
   pr_curve(is_lipids, .pred_No) %>%
   autoplot()+
-  scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#66C2A5"), name= NULL)+
+  scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5"), name= NULL)+
   ggtitle("Area under the precision recall curve - \nNo prediction")
 n2_tree_results %>% # Compare both models
   collect_predictions() %>%
@@ -990,23 +1109,26 @@ n2_tree_results %>% # Compare both models
   bind_rows(rf_results %>%
               collect_predictions() %>%
               mutate(model = "rf")) %>%
-  full_join(., tree_results %>% 
+  bind_rows(., tree_results %>% 
               collect_predictions() %>%
               mutate(model = "tree")) %>%
-  # bind_rows(knn_results %>%
-  #             collect_predictions() %>%
-  #             mutate(model = "knn")) %>%
+  bind_rows(knn_results %>%
+              collect_predictions() %>%
+              mutate(model = "knn")) %>%
   group_by(model) %>%
-  average_precision(is_lipids, .pred_No)
+  pr_auc(is_lipids, .pred_No) %>% 
+  mutate(.metric = "pr_auc_No") %>% 
+  arrange(-.estimate) %>% 
+  mutate(across(where(is.numeric), ~ round(., 3)))
 ```
 <!-- <span style="color:green">For what I can see here, the prediction for No is very precise when the prediction for Yes is less precise.</span>   -->
-<span style="color:green">The Trimmed decision tree exhibit a good PR.</span> 
+<span style="color:green">While the Trimmed decision tree doesn't exhibit the best PR_AUC for No lipid prediction, it has the best PR_AUC for Yes lipid prediction.</span> 
 <span style="color:red">I am then moving forward with the Trimmed decision tree.</span>
 <br>
 <br>
 
 
-# 4. Fit on the whole training / predict on testing data (1799 data)
+# 5. Fit on the whole training / predict on testing data (1799 data)
 ## Analyse results
 ```{r}
 set.seed(1234)
@@ -1024,48 +1146,50 @@ final_fit <- all_workflows %>%
   finalize_workflow(all_workflows %>% 
                       extract_workflow_set_result("basic_n2_Decision_Tree") %>% 
                       select_best(metric = "accuracy")) %>% 
-  last_fit(data_split)
+  last_fit(data_split,
+           metrics = class_metric)
 ```
+
 ## 1.Look at performance with collect_metrics on the testing data (can see if over fit)
 ```{r}
 collect_metrics(final_fit) %>% 
   bind_rows(collect_predictions(final_fit) %>% 
-              specificity(truth = is_lipids, estimate = .pred_class)) %>% 
+              pr_auc(is_lipids, .pred_No) %>% 
+              mutate(.metric = "pr_auc_No")) %>% 
   bind_rows(collect_predictions(final_fit) %>% 
-              sensitivity(truth = is_lipids, estimate = .pred_class)) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              average_precision(is_lipids, .pred_No)) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              precision(truth = is_lipids, estimate = .pred_class)) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              recall(truth = is_lipids, estimate = .pred_class)) %>% 
-  `colnames<-`(c("metric", "estimator", "performance", "config")) %>% 
-  dplyr::select(-c(estimator, config))
-```
-As a reminder, performance on the training set was:
-```{r}
-# Compare to the training previous number
-collect_metrics(n2_tree_results) %>% 
-  `colnames<-`(c("metric", "estimator", "performance", "n", "SD", "config")) %>% 
-  dplyr::select(-c(estimator, n, config))
-```
-The model is not overfitting (performance with the testing set is not lower than with the training set - or within the SD aka specificity).
-```{r}
-collect_metrics(final_fit) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              specificity(truth = is_lipids, estimate = .pred_class)) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              sensitivity(truth = is_lipids, estimate = .pred_class)) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              precision(truth = is_lipids, estimate = .pred_class)) %>% 
-  bind_rows(collect_predictions(final_fit) %>% 
-              recall(truth = is_lipids, estimate = .pred_class)) %>% 
+              pr_auc(is_lipids, .pred_Yes) %>% 
+              mutate(.metric = "pr_auc_Yes")) %>% 
+  # bind_rows(collect_predictions(final_fit) %>% 
+  #             specificity(truth = is_lipids, estimate = .pred_class)) %>% 
+  # bind_rows(collect_predictions(final_fit) %>% 
+  #             sensitivity(truth = is_lipids, estimate = .pred_class)) %>% 
+  # bind_rows(collect_predictions(final_fit) %>% 
+  #             precision(truth = is_lipids, estimate = .pred_class)) %>% 
+  # bind_rows(collect_predictions(final_fit) %>% 
+  #             recall(truth = is_lipids, estimate = .pred_class)) %>% 
 
   `colnames<-`(c("metric", "estimator", "performance", "config")) %>% 
   mutate(model = "testing") %>% 
   bind_rows(.,
             collect_metrics(n2_tree_results) %>% 
               `colnames<-`(c("metric", "estimator", "performance", "n", "std_err", "config")) %>% 
+              bind_rows(., 
+                        n2_tree_results %>% # Compare both models
+  collect_predictions(summarize = FALSE) %>%
+  group_by(id) %>% 
+  pr_auc(is_lipids, .pred_No) %>% 
+  ungroup() %>% 
+  summarize(performance = mean(.estimate),
+            std_err = sd(.estimate)) %>% 
+  mutate(metric = "pr_auc_No")) %>% 
+    bind_rows(., n2_tree_results %>% # Compare both models
+  collect_predictions(summarize = FALSE) %>%
+  group_by(id) %>% 
+  pr_auc(is_lipids, .pred_Yes) %>% 
+  ungroup() %>% 
+  summarize(performance = mean(.estimate),
+            std_err = sd(.estimate)) %>% 
+  mutate(metric = "pr_auc_Yes")) %>% 
               mutate(model = "training")
               ) %>% 
   mutate(model = factor(model, levels = c("training", "testing"))) %>% 
@@ -1081,6 +1205,44 @@ collect_metrics(final_fit) %>%
                 position=position_dodge(width=0.9))+
   scale_fill_viridis_d(option = "G", begin = 0.3, end = 0.8, 
                         name = NULL)
+```
+The model is not overfitting (performance with the testing set is not lower than with the training set - or within the SD aka specificity).
+
+```{r}
+collect_metrics(final_fit) %>% 
+  bind_rows(collect_predictions(final_fit) %>% 
+              pr_auc(is_lipids, .pred_No) %>% 
+              mutate(.metric = "pr_auc_No")) %>% 
+  bind_rows(collect_predictions(final_fit) %>% 
+              pr_auc(is_lipids, .pred_Yes) %>% 
+              mutate(.metric = "pr_auc_Yes")) %>% 
+  `colnames<-`(c("metric", "estimator", "performance", "config")) %>% 
+  dplyr::select(-c(estimator, config)) %>% 
+  mutate(across(where(is.numeric), ~ round(., 3)))
+```
+As a reminder, performance on the training set was:
+```{r}
+# Compare to the training previous number
+collect_metrics(n2_tree_results) %>% 
+              `colnames<-`(c("metric", "estimator", "performance", "n", "std_err", "config")) %>% 
+              bind_rows(., n2_tree_results %>% # Compare both models
+  collect_predictions(summarize = FALSE) %>%
+  group_by(id) %>% 
+  pr_auc(is_lipids, .pred_No) %>% 
+  ungroup() %>% 
+  summarize(performance = mean(.estimate),
+            std_err = sd(.estimate)) %>% 
+  mutate(metric = "pr_auc_No")) %>% 
+    bind_rows(., n2_tree_results %>% # Compare both models
+  collect_predictions(summarize = FALSE) %>%
+  group_by(id) %>% 
+  pr_auc(is_lipids, .pred_Yes) %>% 
+  ungroup() %>% 
+  summarize(performance = mean(.estimate),
+            std_err = sd(.estimate)) %>% 
+  mutate(metric = "pr_auc_Yes")) %>% 
+  dplyr::select(-c(estimator, n, config)) %>% 
+  mutate(across(where(is.numeric), ~ round(., 3)))
 ```
 
 ## 2.Get predictions out on the testing dataset
@@ -1104,15 +1266,14 @@ final_fit %>%
   collect_predictions() %>%
   conf_mat(is_lipids, .pred_class)
 ```
-<!-- ## 3.Look at variable importance -->
-<!-- ```{r} -->
-<!-- dt_fit <-  -->
-<!--   final_fit %>%  -->
-<!--   extract_fit_parsnip() -->
-<!-- #Generate Decision Tree Plot Using rpart.plot package -->
-<!-- rpart.plot::rpart.plot(dt_fit$fit) -->
-
-<!-- ``` -->
+## 3.Look at variable importance
+```{r}
+dt_fit <-
+  final_fit %>%
+  extract_fit_parsnip()
+#Generate Decision Tree Plot Using rpart.plot package
+rpart.plot::rpart.plot(dt_fit$fit)
+```
 
 ## 4.What is the m/z-buffer_percent pattern of predicted data over training data?
 ```{r}
@@ -1154,12 +1315,19 @@ final_fit %>%
   dplyr::select(hmdb, row_m_z, buffer_percent, is_lipids, .pred_class, concordant) %>% 
   arrange(desc(concordant))
 ```
+<br>
 
-# 5. Prediction on validation data 3990 with Trimmed Decision Tree
+***
+<br>
+
+# VI. Prediction on validation data 3990 with Trimmed Decision Tree
+## 1. Cleaning
 The new data is cleaned in the same manner as the data used to create the machine learning model.  
 - keep row_retention_time > 1 & < 14  
 - keep only metabolite row entry when positive and negative metabolites are present
 
+## 2. Data Exploaration
+### Identified metabolites
 ```{r}
 tbl <- validation3990_data %>% 
   dplyr::select(non_heavy_identified_flag) %>% 
@@ -1182,7 +1350,19 @@ validation3990_data %>%
   )
 ```
 
+<!-- ### Lipids -->
+<!-- What is the proportion of lipids in the validation data -->
+<!-- ```{r} -->
+<!-- validation3990_data %>% -->
+<!--   ggplot(aes(x=is_lipids, fill= is_lipids))+ -->
+<!--   geom_bar() -->
 
+<!-- validation3990_data %>%  -->
+<!--   dplyr::select(is_lipids) %>%  -->
+<!--   tbl_summary(type = list(is_lipids ~ "categorical")) -->
+<!-- ``` -->
+
+## 3. Apply our model to the validation data
 ```{r predict new data}
 final_fitted <- extract_workflow(final_fit)
 
@@ -1190,33 +1370,46 @@ set.seed(1234)
 predicted_validation3990_data <- augment(final_fitted, validation3990_data)
 ```
 
-Performance
+### Performance
 ```{r performance validation}
 predicted_validation3990_data %>% 
   accuracy(truth = is_lipids, estimate = .pred_class) %>% 
+  bind_rows(predicted_validation3990_data %>%
+              pr_auc(is_lipids, .pred_No) %>%
+              mutate(.metric = "pr_auc_No")) %>%
   bind_rows(predicted_validation3990_data %>% 
-              roc_auc(is_lipids, .pred_No)) %>% 
+              pr_auc(is_lipids, .pred_Yes) %>%
+              mutate(.metric = "pr_auc_Yes")) %>% 
   bind_rows(predicted_validation3990_data %>% 
               specificity(truth = is_lipids, estimate = .pred_class)) %>% 
   bind_rows(predicted_validation3990_data %>% 
               sensitivity(truth = is_lipids, estimate = .pred_class)) %>% 
   bind_rows(predicted_validation3990_data %>% 
-              average_precision(is_lipids, .pred_No)) %>% 
+              roc_auc(is_lipids, .pred_No)) %>% 
+  bind_rows(predicted_validation3990_data %>% 
+              average_precision(is_lipids, .pred_Yes)) %>% 
   bind_rows(predicted_validation3990_data %>% 
               precision(truth = is_lipids, estimate = .pred_class)) %>% 
   bind_rows(predicted_validation3990_data %>% 
-              recall(truth = is_lipids, estimate = .pred_class))
+              recall(truth = is_lipids, estimate = .pred_class)) %>% 
+  mutate(across(where(is.numeric), ~ round(., 3)))
 
 predicted_validation3990_data %>% 
   accuracy(truth = is_lipids, estimate = .pred_class) %>% 
+  bind_rows(predicted_validation3990_data %>%
+              pr_auc(is_lipids, .pred_No) %>%
+              mutate(.metric = "pr_auc_No")) %>%
   bind_rows(predicted_validation3990_data %>% 
-              roc_auc(is_lipids, .pred_No)) %>% 
+              pr_auc(is_lipids, .pred_Yes) %>%
+              mutate(.metric = "pr_auc_Yes")) %>% 
   bind_rows(predicted_validation3990_data %>% 
               specificity(truth = is_lipids, estimate = .pred_class)) %>% 
   bind_rows(predicted_validation3990_data %>% 
               sensitivity(truth = is_lipids, estimate = .pred_class)) %>% 
   bind_rows(predicted_validation3990_data %>% 
-              average_precision(is_lipids, .pred_No)) %>% 
+              roc_auc(is_lipids, .pred_No)) %>% 
+  bind_rows(predicted_validation3990_data %>% 
+              average_precision(is_lipids, .pred_Yes)) %>% 
   bind_rows(predicted_validation3990_data %>% 
               precision(truth = is_lipids, estimate = .pred_class)) %>% 
   bind_rows(predicted_validation3990_data %>% 
@@ -1233,15 +1426,18 @@ predicted_validation3990_data %>%
 #   autoplot()
 
 
-# predicted_validation3990_data %>% 
+# predicted_validation3990_data %>%
 #   pr_curve(is_lipids, .pred_No) %>%
+#   autoplot()
+# predicted_validation3990_data %>%
+#   pr_curve(is_lipids, .pred_Yes) %>%
 #   autoplot()
 ```
 
 
 
 
-get predictions out collect_predictions
+### Get predictions out
 ```{r conf mat validation}
 # df <- final_fit %>%
 #   collect_predictions()
@@ -1261,23 +1457,23 @@ ggplot(conf_tab, aes(Var1, Var2, fill = Freq)) +
 predicted_validation3990_data %>%
   conf_mat(is_lipids, .pred_class)
 ```
-<!-- look at var importance -->
-<!-- ```{r draw tree validation} -->
-<!-- dt_fit <-  -->
-<!--   final_fitted %>%  -->
-<!--   extract_fit_parsnip() -->
-<!-- #Generate Decision Tree Plot Using rpart.plot package -->
-<!-- rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE) -->
-<!-- # probability per class of observations in the node -->
-<!-- rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, extra = 1) -->
-<!-- rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, extra = 0) -->
-<!-- # rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, box.palette = c("grey", "slateblue", "tomato")) -->
-<!-- # rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, box.palette = "YlGnBl") -->
-<!-- # rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, box.palette = "RdYlGn") -->
-<!-- # rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, prefix="Lipids ", border.col= "blue") -->
-<!-- ``` -->
+look at var importance
+```{r draw tree validation}
+dt_fit <-
+  final_fitted %>%
+  extract_fit_parsnip()
+#Generate Decision Tree Plot Using rpart.plot package
+# rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE)
+# probability per class of observations in the node
+rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, extra = 1)
+# rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, extra = 0)
+# rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, box.palette = c("grey", "slateblue", "tomato"))
+# rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, box.palette = "YlGnBl")
+# rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, box.palette = "RdYlGn")
+# rpart.plot::rpart.plot(dt_fit$fit, roundint = FALSE, prefix="Lipids ", border.col= "blue")
+```
 
-What is the m/z-rentention time pattern of predicted data?
+### What is the m/z-rentention time pattern of predicted data?
 ```{r plot validation}
 predicted_validation3990_data %>% 
   mutate(concordant = case_when(
@@ -1298,6 +1494,10 @@ predicted_validation3990_data %>%
   dplyr::select(hmdb, row_identity_all_i_ds, row_m_z, buffer_percent, is_lipids, .pred_class, concordant) %>% 
   arrange(desc(concordant), is_lipids)
 ```
+<br>
+
+***
+<br>
 
 
 # Part II
@@ -1471,8 +1671,8 @@ collect_metrics(all_workflows) %>%
                 ymin = as.numeric(two_predictor_perfmean_n2DT) - as.numeric(two_predictor_perfsd_n2DT),
                 ymax = as.numeric(two_predictor_perfmean_n2DT) + as.numeric(two_predictor_perfsd_n2DT)),
             fill= "grey90", color= "transparent")+
-  geom_point(size = 3, color= "#8DA0CB") +
-  geom_errorbar(aes(ymin = mean-std_err, ymax = mean+std_err), color= "#8DA0CB") +
+  geom_point(size = 3, color= "#66C2A5") +
+  geom_errorbar(aes(ymin = mean-std_err, ymax = mean+std_err), color= "#66C2A5") +
   geom_hline(aes(yintercept = as.numeric(two_predictor_perfmean_n2DT)), color= "#E5C494", linetype= 2)+
   # ylim(0.57, 0.95)+
   theme_classic()+
